@@ -1,0 +1,9 @@
+# directory
+checkpoints/
+__pycache__/
+logs/
+datasets/
+wandb/
+
+*.json
+*.jsonl
