@@ -543,7 +543,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt_style",
         type=str,
-        choices=["xml", "raw_long_cot"],
+        choices=["xml", "raw_long_cot", "answer_first"],
         default="xml",
         help="Prompt format used to build eval inputs.",
     )
