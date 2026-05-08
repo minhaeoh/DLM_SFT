@@ -45,6 +45,10 @@ class DiffuSelfDistillConfig(TrainingArguments):
             "help": "Compatibility flag. long-CoT now keeps raw dataset responses without XML reformatting."
         },
     )
+    prompt_type: str = field(
+        default="default",
+        metadata={"help": "Prompt style appended to each question: default | format | answer_first."},
+    )
     teacher_reference_mode: str = field(
         default="full",
         metadata={

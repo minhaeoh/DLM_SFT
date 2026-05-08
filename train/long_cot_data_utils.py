@@ -7,9 +7,43 @@ import torch
 from datasets import Dataset, DatasetDict, load_from_disk
 
 
-SYSTEM_PROMPT = """
+DEFAULT_PROMPT = """
 Please reason step by step, and put your final answer within \boxed{}.
 """
+
+FORMAT_PROMPT = """
+Please reason step by step and respond in the following format, with the final answer inside \boxed{}:
+
+<reasoning>
+...
+</reasoning>
+<answer>
+...
+</answer>
+"""
+
+ANSWER_FIRST_PROMPT = """
+Please reason step by step, but respond with the final answer first inside \boxed{}, followed by the reasoning:
+
+<answer>
+...
+</answer>
+<reasoning>
+...
+</reasoning>
+"""
+
+
+PROMPT_TYPE_TO_TEXT = {
+    "default": DEFAULT_PROMPT,
+    "format": FORMAT_PROMPT,
+    "answer_first": ANSWER_FIRST_PROMPT,
+}
+PROMPT_TYPE_ALIASES = {
+    "answer-first": "answer_first",
+    "answerfirst": "answer_first",
+}
+
 
 DEFAULT_DATASET_PATH = "dataset/Math-CoT-NoCoT-20k-4096"
 DEFAULT_DATASET_NAME = "math_long_cot"
@@ -89,6 +123,15 @@ def _normalize_response_source(source: str, field_name: str) -> str:
     return normalized_source
 
 
+def _normalize_prompt_type(prompt_type: str) -> str:
+    normalized_prompt_type = str(prompt_type or "default").strip().lower()
+    normalized_prompt_type = PROMPT_TYPE_ALIASES.get(normalized_prompt_type, normalized_prompt_type)
+    if normalized_prompt_type not in PROMPT_TYPE_TO_TEXT:
+        valid = ", ".join(sorted(PROMPT_TYPE_TO_TEXT))
+        raise ValueError(f"Unsupported prompt_type `{prompt_type}`. Expected one of: {valid}.")
+    return normalized_prompt_type
+
+
 def _truncate_reasoning_for_teacher(reasoning_text: str) -> str:
     reasoning_text = _safe_str(reasoning_text).strip()
     if not reasoning_text:
@@ -137,11 +180,12 @@ def _format_math_response(raw_response_text: str, mode: int) -> str:
     return _math_response(raw_response_text)
 
 
-def _build_math_user_prompt(question: str, mode: int) -> str:
+def _build_math_user_prompt(question: str, mode: int, prompt_type: str = "default") -> str:
     _normalize_response_mode(mode)
+    normalized_prompt_type = _normalize_prompt_type(prompt_type)
     return (
-        f"{question}\n\n"
-        f"{SYSTEM_PROMPT}"
+        f"Question:\n{question}\n\n"
+        f"{PROMPT_TYPE_TO_TEXT[normalized_prompt_type].strip()}"
     )
 
 
@@ -211,6 +255,7 @@ def _format_example(
     tokenizer,
     gold_mode: int,
     target_mode: int,
+    prompt_type: str,
     teacher_reference_mode: str,
     reference_response_source: str,
     target_response_source: str,
@@ -219,10 +264,11 @@ def _format_example(
     if not question:
         raise ValueError("Every example must contain a non-empty `question` field.")
 
+    prompt_type = _normalize_prompt_type(prompt_type)
     reference_raw_response = _select_response_text(example, reference_response_source)
     target_raw_response = _select_response_text(example, target_response_source)
 
-    user_prompt = _build_math_user_prompt(question, mode=gold_mode)
+    user_prompt = _build_math_user_prompt(question, mode=gold_mode, prompt_type=prompt_type)
     gold_response = _format_math_response(reference_raw_response, mode=gold_mode)
     target_response = _format_math_response(target_raw_response, mode=target_mode)
     teacher_reference_response = _build_teacher_reference_response(
@@ -244,6 +290,7 @@ def _format_example(
         "tf_target_response": target_response,
         "solution_quality": "full",
         "dataset_name": DEFAULT_DATASET_NAME,
+        "prompt_type": prompt_type,
         "reference_response_source": _normalize_response_source(
             reference_response_source,
             field_name="reference_response_source",
@@ -260,6 +307,7 @@ def _format_dataset(
     tokenizer,
     gold_mode: int,
     target_mode: int,
+    prompt_type: str,
     teacher_reference_mode: str,
     reference_response_source: str,
     target_response_source: str,
@@ -271,6 +319,7 @@ def _format_dataset(
             tokenizer=tokenizer,
             gold_mode=gold_mode,
             target_mode=target_mode,
+            prompt_type=prompt_type,
             teacher_reference_mode=teacher_reference_mode,
             reference_response_source=reference_response_source,
             target_response_source=target_response_source,
@@ -287,6 +336,7 @@ def get_distillation_datasets(
     seed: int = 42,
     gold_mode: int = 1,
     target_mode: int = 1,
+    prompt_type: str = "default",
     teacher_reference_mode: str = "full",
     reference_response_source: str = "cot",
     target_response_source: str = "cot",
@@ -294,6 +344,7 @@ def get_distillation_datasets(
 ):
     gold_mode = _normalize_response_mode(gold_mode, mode_name="gold_mode")
     target_mode = _normalize_response_mode(target_mode, mode_name="target_mode")
+    prompt_type = _normalize_prompt_type(prompt_type)
     teacher_reference_mode = _normalize_teacher_reference_mode(teacher_reference_mode)
     reference_response_source = _normalize_response_source(
         reference_response_source,
@@ -317,6 +368,7 @@ def get_distillation_datasets(
         tokenizer=tokenizer,
         gold_mode=gold_mode,
         target_mode=target_mode,
+        prompt_type=prompt_type,
         teacher_reference_mode=teacher_reference_mode,
         reference_response_source=reference_response_source,
         target_response_source=target_response_source,
@@ -327,6 +379,7 @@ def get_distillation_datasets(
             tokenizer=tokenizer,
             gold_mode=gold_mode,
             target_mode=target_mode,
+            prompt_type=prompt_type,
             teacher_reference_mode=teacher_reference_mode,
             reference_response_source=reference_response_source,
             target_response_source=target_response_source,

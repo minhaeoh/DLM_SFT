@@ -978,6 +978,17 @@ class DiffuSelfDistillTrainer(Trainer):
             clean_up_tokenization_spaces=False,
         )
 
+    def _decode_model_input_text(
+        self,
+        input_ids: torch.Tensor,
+        prompt_len: int,
+        response_len: int,
+    ) -> str:
+        total_len = max(int(prompt_len), 0) + max(int(response_len), 0)
+        if total_len <= 0:
+            return ""
+        return self._decode_token_ids(input_ids[:total_len])
+
     def _ensure_debug_examples_file(self):
         if self._debug_examples_initialized:
             return
@@ -1319,6 +1330,16 @@ class DiffuSelfDistillTrainer(Trainer):
             shared_response_ids = inputs["response_ids"][i, :response_len]
             student_mask_i = inputs["student_mask"][i, :response_len]
             kd_mask_i = inputs["kd_mask"][i, :response_len]
+            student_input_text = self._decode_model_input_text(
+                inputs["student_input_ids"][i],
+                prompt_len=student_prompt_len,
+                response_len=response_len,
+            )
+            teacher_input_text = self._decode_model_input_text(
+                inputs["teacher_input_ids"][i],
+                prompt_len=teacher_prompt_len,
+                response_len=response_len,
+            )
             student_masked_response_ids = inputs["student_input_ids"][
                 i, student_prompt_len : student_prompt_len + response_len
             ]
@@ -1493,6 +1514,9 @@ class DiffuSelfDistillTrainer(Trainer):
                     "num_student_masked_tokens": int(student_mask_i.sum().item()),
                     "num_teacher_masked_tokens": int(kd_mask_i.sum().item()),
                     "num_teacher_hint_tokens": int((student_mask_i & ~kd_mask_i).sum().item()),
+                    "input_text": student_input_text,
+                    "student_input_text": student_input_text,
+                    "teacher_input_text": teacher_input_text,
                     "student_prompt_text": self._decode_token_ids(student_prompt_ids),
                     "teacher_prompt_text": self._decode_token_ids(teacher_prompt_ids),
                     "gold_response_text": self._decode_token_ids(gold_response_ids),
@@ -1579,6 +1603,11 @@ class DiffuSelfDistillTrainer(Trainer):
             kd_positions = torch.nonzero(kd_mask_i, as_tuple=False).flatten()
             shared_response_ids = inputs["response_ids"][i, :response_len]
             student_response_logits = student_logits[i, student_prompt_len : student_prompt_len + response_len, :]
+            student_input_text = self._decode_model_input_text(
+                inputs["student_input_ids"][i],
+                prompt_len=student_prompt_len,
+                response_len=response_len,
+            )
 
             student_top1_token_ids = torch.argmax(student_response_logits, dim=-1)
             student_reconstructed_ids = torch.where(kd_mask_i, student_top1_token_ids, shared_response_ids)
@@ -1590,6 +1619,8 @@ class DiffuSelfDistillTrainer(Trainer):
                 "t_value": float(inputs["effective_t_values"][i].item()),
                 "response_length": response_len,
                 "num_masked_tokens": int(kd_positions.numel()),
+                "input_text": student_input_text,
+                "student_input_text": student_input_text,
                 "target_response_text": self._decode_token_ids(shared_response_ids),
                 "student_generated_text": self._decode_token_ids(student_reconstructed_ids),
                 "masked_response_positions": kd_positions.detach().cpu().tolist(),
@@ -1611,11 +1642,17 @@ class DiffuSelfDistillTrainer(Trainer):
                 )
 
             teacher_prompt_len = int(inputs["teacher_prompt_lengths"][i].item())
+            teacher_input_text = self._decode_model_input_text(
+                inputs["teacher_input_ids"][i],
+                prompt_len=teacher_prompt_len,
+                response_len=response_len,
+            )
             teacher_response_logits = teacher_logits[i, teacher_prompt_len : teacher_prompt_len + response_len, :]
             teacher_top1_token_ids = torch.argmax(teacher_response_logits, dim=-1)
             teacher_reconstructed_ids = torch.where(kd_mask_i, teacher_top1_token_ids, shared_response_ids)
             record.update(
                 {
+                    "teacher_input_text": teacher_input_text,
                     "teacher_generated_text": self._decode_token_ids(teacher_reconstructed_ids),
                     "teacher_top1_token_ids": teacher_top1_token_ids.index_select(0, kd_positions).detach().cpu().tolist(),
                     "teacher_top1_logits": self._masked_top1_logits(
