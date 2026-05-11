@@ -27,29 +27,9 @@ class BlockDiffusionConfig(TrainingArguments):
         default="dataset/Math-CoT-NoCoT-20k-4096",
         metadata={"help": "Dataset path loaded via datasets.load_from_disk()."},
     )
-    reference_response_source: str = field(
-        default="cot",
-        metadata={
-            "help": "Kept for dataset formatting compatibility. Not used by the block diffusion trainer itself."
-        },
-    )
     target_response_source: str = field(
         default="cot",
         metadata={"help": "Response source used as the clean training target: cot | noncot."},
-    )
-    gold_mode: int = field(
-        default=1,
-        metadata={"help": "Compatibility flag reused from the long-CoT data formatter."},
-    )
-    target_mode: int = field(
-        default=1,
-        metadata={"help": "Compatibility flag reused from the long-CoT data formatter."},
-    )
-    teacher_reference_mode: str = field(
-        default="full",
-        metadata={
-            "help": "Compatibility flag for dataset formatting. The trainer does not consume teacher prompts."
-        },
     )
     max_length: int = field(
         default=4096,

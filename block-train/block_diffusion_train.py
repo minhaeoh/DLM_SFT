@@ -184,10 +184,6 @@ def main():
         train_split=args.train_split,
         eval_split=args.eval_split,
         seed=args.seed,
-        gold_mode=args.gold_mode,
-        target_mode=args.target_mode,
-        teacher_reference_mode=args.teacher_reference_mode,
-        reference_response_source=args.reference_response_source,
         target_response_source=args.target_response_source,
         heldout_eval_ratio=args.heldout_eval_ratio,
     )

@@ -10,7 +10,6 @@ from long_cot_config import DiffuSelfDistillConfig
 from long_cot_trainer import (
     DiffuSelfDistillDataCollator,
     DiffuSelfDistillTrainer,
-    normalize_ce_mask_mode,
     normalize_training_method,
 )
 
@@ -161,9 +160,7 @@ def load_model_and_tokenizer(args: DiffuSelfDistillConfig):
 
 def main():
     args = parse_args()
-    args.method_spec = args.method
-    args.method = normalize_training_method(args.method_spec)
-    args.ce_mask_mode = normalize_ce_mask_mode(args.ce_mask_mode)
+    args.method = normalize_training_method(args.method)
     configure_wandb_env(args)
     set_random_seed(args.seed)
 
@@ -175,11 +172,7 @@ def main():
         train_split=args.train_split,
         eval_split=args.eval_split,
         seed=args.seed,
-        gold_mode=args.gold_mode,
-        target_mode=args.target_mode,
         prompt_type=args.prompt_type,
-        teacher_reference_mode=args.teacher_reference_mode,
-        reference_response_source=args.reference_response_source,
         target_response_source=args.target_response_source,
         heldout_eval_ratio=args.heldout_eval_ratio,
     )
@@ -212,7 +205,6 @@ def main():
         t_curriculum_end_min=args.t_curriculum_end_min,
         t_curriculum_end_max=args.t_curriculum_end_max,
         t_curriculum_total_batches=args.t_curriculum_total_batches,
-        method=args.method_spec,
         dataset_name=args.dataset,
     )
 

@@ -7,10 +7,13 @@ from transformers import TrainingArguments
 @dataclass
 class DiffuSelfDistillConfig(TrainingArguments):
     """
-    Training configuration for diffusion self-distillation.
+    Training configuration for long-CoT INP-OH training.
 
-    This stage keeps d1-style masked denoising, but replaces RL with
-    teacher-student KL distillation on masked response tokens.
+    This trainer is intentionally narrow:
+    - only `method=INP_OH` is supported
+    - the main loss is masked-token cross entropy on the noisy target response
+    - optional auxiliary CE, when enabled, is always applied over the full response
+    - there is no teacher prompt / teacher forward branch
     """
 
     model_path: str = field(
@@ -25,39 +28,17 @@ class DiffuSelfDistillConfig(TrainingArguments):
         default="dataset/Math-CoT-NoCoT-20k-4096",
         metadata={"help": "Dataset path loaded via datasets.load_from_disk()."},
     )
-    reference_response_source: str = field(
-        default="cot",
-        metadata={"help": "Teacher reference source: cot | noncot."},
-    )
     target_response_source: str = field(
         default="cot",
-        metadata={"help": "Student target source: cot | noncot."},
-    )
-    gold_mode: int = field(
-        default=1,
-        metadata={
-            "help": "Compatibility flag. long-CoT now keeps raw dataset responses without XML reformatting."
-        },
-    )
-    target_mode: int = field(
-        default=1,
-        metadata={
-            "help": "Compatibility flag. long-CoT now keeps raw dataset responses without XML reformatting."
-        },
+        metadata={"help": "Response source used as the clean training target: cot | noncot."},
     )
     prompt_type: str = field(
         default="default",
         metadata={"help": "Prompt style appended to each question: default | format | answer_first."},
     )
-    teacher_reference_mode: str = field(
-        default="full",
-        metadata={
-            "help": "Teacher reference mode over the raw reference response: full | leave_last_step | answer_only."
-        },
-    )
     max_length: int = field(
         default=4096,
-        metadata={"help": "Max sequence length for each branch: [prompt; masked_response]."},
+        metadata={"help": "Max total length for [prompt; response]."},
     )
     train_split: str = field(
         default="train",
@@ -82,21 +63,15 @@ class DiffuSelfDistillConfig(TrainingArguments):
         metadata={"help": "Optional cap for eval dataset size (debug/smoke runs)."},
     )
     method: str = field(
-        default="ALL_MASK",
+        default="INP_OH",
         metadata={
-            "help": "Training method: ALL_MASK | INP | INP-OH | INP-OH-PAD. `SFT` is accepted as an alias for ALL_MASK."
+            "help": "Compatibility flag. Only INP_OH is supported by this trainer."
         },
     )
 
     mask_id: int = field(
         default=126336,
         metadata={"help": "Mask token id for diffusion noising."},
-    )
-    unmask_xml_tags: bool = field(
-        default=False,
-        metadata={
-            "help": "Compatibility flag for older XML-formatted data. Raw-response long-CoT does not add XML tags."
-        },
     )
     t_min: float = field(
         default=1e-3,
@@ -168,26 +143,20 @@ class DiffuSelfDistillConfig(TrainingArguments):
         default=0.5,
         metadata={"help": "Optional auxiliary CE weight. If <= 0, CE is disabled."},
     )
-    ce_mask_mode: str = field(
-        default="masked",
-        metadata={
-            "help": "Where to apply auxiliary CE when ce_weight > 0: answer | full | masked."
-        },
-    )
     loss_chunk_size: int = field(
         default=128,
-        metadata={"help": "Number of response tokens processed at once when computing KD/CE losses."},
+        metadata={"help": "Number of response tokens processed at once when computing losses."},
     )
     disable_dropout: bool = field(
         default=True,
         metadata={
-            "help": "Disable dropout so teacher targets are stable when teacher/student share weights."
+            "help": "Disable dropout during training for more stable masked-token targets."
         },
     )
     debug_save_examples: int = field(
         default=0,
         metadata={
-            "help": "If > 0, enable saving every training example seen during training with gold/masked inputs and teacher/student predictions."
+            "help": "If > 0, save per-batch debug examples with masked inputs and student predictions."
         },
     )
     debug_save_examples_filename: str = field(
