@@ -58,7 +58,6 @@ SEED="${SEED:-42}"
 BF16="${BF16:-True}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-False}"
 CE_WEIGHT="${CE_WEIGHT:-0.5}"
-CE_MASK_MODE="${CE_MASK_MODE:-masked}"
 PROMPT_STYLE="${PROMPT_STYLE:-default}"
 OVERWRITE_OUTPUT_DIR="${OVERWRITE_OUTPUT_DIR:-0}"
 BASE_MAIN_PROCESS_PORT="${BASE_MAIN_PROCESS_PORT:-29600}"
@@ -158,7 +157,6 @@ echo "LOSS_CHUNK_SIZE             : ${LOSS_CHUNK_SIZE}"
 echo "BF16                        : ${BF16}"
 echo "GRADIENT_CHECKPOINTING      : ${GRADIENT_CHECKPOINTING}"
 echo "CE_WEIGHT                   : ${CE_WEIGHT}"
-echo "CE_MASK_MODE                : ${CE_MASK_MODE}"
 echo "PROMPT_STYLE                : ${PROMPT_STYLE}"
 echo "TOTAL_SIZE                  : ${TOTAL_SIZE}"
 echo "TRAIN_SIZE                  : ${TRAIN_SIZE}"
@@ -170,16 +168,15 @@ echo "========================================"
 
 run_experiment() {
   local method="$1"
-  local reference_source="$2"
-  local target_source="$3"
-  local run_index="$4"
+  local target_source="$2"
+  local run_index="$3"
   local prompt_style="${PROMPT_STYLE}"
   local effective_dataset_path="${DATASET_PATH}"
-  if [[ $# -ge 5 && "${5}" != --* ]]; then
-    prompt_style="$5"
-    shift 5
-  else
+  if [[ $# -ge 4 && "${4}" != --* ]]; then
+    prompt_style="$4"
     shift 4
+  else
+    shift 3
   fi
   local extra_train_args=("$@")
   local filtered_extra_train_args=()
@@ -272,26 +269,15 @@ run_experiment() {
   prompt_style_label="$(printf '%s' "${prompt_style}" | tr '[:upper:]-' '[:lower:]_')"
 
   case "${normalized_method}" in
-    INP_OH)
-      effective_ce_weight="0.0"
-      run_method_label="SFT_tgt${target_source}_${prompt_style_label}_prompt"
-      ;;
-    INP_OH_PAD)
-      effective_ce_weight="0.0"
-      run_method_label="SFT-includePAD_tgt${target_source}"
-      ;;
-    INP)
-      run_method_label="INP-ce${effective_ce_weight}_ref${reference_source}_tgt${target_source}"
-      ;;
-    ALL_MASK)
-      run_method_label="ALL-MASK-ce${effective_ce_weight}_ref${reference_source}_tgt${target_source}"
+    SFT|INP_OH)
+      run_method_label="SFT_tgt${target_source}"
       ;;
     *)
       run_method_label="${method}"
       ;;
   esac
 
-  run_method_label="${run_method_label}_prompt${prompt_style_label}"
+  run_method_label="${run_method_label}_${prompt_style_label}"
 
   case "${extra_t_sampling_mode}" in
     biased_to_one|biased-to-one|biasedtoone|high-bias|highbias)
@@ -317,7 +303,6 @@ run_experiment() {
   echo "Starting run                 : ${run_name}"
   echo "METHOD                       : ${method}"
   echo "RUN_METHOD_LABEL             : ${run_method_label}"
-  echo "REFERENCE_RESPONSE_SOURCE    : ${reference_source}"
   echo "TARGET_RESPONSE_SOURCE       : ${target_source}"
   echo "PROMPT_STYLE                 : ${prompt_style}"
   echo "DATASET_PATH                 : ${effective_dataset_path}"
@@ -349,7 +334,6 @@ run_experiment() {
     --dataset "${effective_dataset_label}"
     --dataset_path "${effective_dataset_path}"
     --method "${method}"
-    --reference_response_source "${reference_source}"
     --target_response_source "${target_source}"
     --prompt_type "${prompt_style}"
     --output_dir "${output_dir}"
@@ -379,7 +363,6 @@ run_experiment() {
     --report_to "${REPORT_TO}"
     --seed "${SEED}"
     --ce_weight "${effective_ce_weight}"
-    --ce_mask_mode "${CE_MASK_MODE}"
   )
 
   if [[ "${OVERWRITE_OUTPUT_DIR}" == "1" ]]; then
@@ -398,32 +381,29 @@ run_experiment() {
   echo "Saved run log to             : ${run_log_file}"
 }
 
-# For one-hot teacher methods, reference is not consumed by the KD target.
-# We keep reference=target here so the run definition stays easy to read.
-run_experiment "INP_OH" "noncot" "noncot" 0 "format"
-run_experiment "INP_OH" "noncot" "noncot" 0 "answer_first"
-run_experiment "INP_OH" "noncot" "cot" 0 "format"
-run_experiment "INP_OH" "noncot" "cot" 0 "answer_first"
-run_experiment "INP_OH" "noncot" "noncot" 0 "format" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/Math-NoCoT-format-4096"
-run_experiment "INP_OH" "noncot" "noncot" 0 "answer_first" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/Math-NoCoT-format-4096"
-# run_experiment "INP_OH" "cot" "cot" 1
-# run_experiment "INP_OH" "noncot" "noncot" 2 \
+run_experiment "SFT" "noncot" 0 "format"
+run_experiment "SFT" "noncot" 0 "answer_first"
+run_experiment "SFT" "cot" 0 "format"
+run_experiment "SFT" "cot" 0 "answer_first"
+run_experiment "SFT" "noncot" 0 "format" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/Math-NoCoT-format-4096"
+run_experiment "SFT" "noncot" 0 "answer_first" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/Math-NoCoT-format-4096"
+# run_experiment "SFT" "cot" 1
+# run_experiment "SFT" "noncot" 2 \
 #   --t_sampling_mode=biased_to_one \
 #   --t_biased_to_one_strength=2.0
-# run_experiment "INP_OH" "cot" "cot" 3 \
+# run_experiment "SFT" "cot" 3 \
 #   --t_sampling_mode=biased_to_one \
 #   --t_biased_to_one_strength=2.0
 # Example: switch prompt style per run.
-# run_experiment "INP_OH" "cot" "cot" 4 "format"
+# run_experiment "SFT" "cot" 4 "format"
 # Example: switch dataset path for one run.
-# run_experiment "INP_OH" "cot" "cot" 5 "default" --dataset_path "/path/to/other/dataset"
-# run_experiment "INP_OH" "noncot" "noncot" 2
+# run_experiment "SFT" "cot" 5 "default" --dataset_path "/path/to/other/dataset"
+# run_experiment "SFT" "noncot" 2
 # Example: sample continuously over [t_min, t_max] while biasing toward higher t.
-# run_experiment "ALL_MASK" "noncot" "cot" 1
-# run_experiment "INP" "noncot" "cot" 2
-# run_experiment "INP" "cot" "noncot" 3
-# run_experiment "ALL_MASK" "cot" "noncot" 1
-# run_experiment "ALL_MASK" "noncot" "cot" 2
+# run_experiment "SFT" "noncot" 1 \
+#   --t_sampling_mode=uniform \
+#   --t_min=0.2 \
+#   --t_max=0.9
 
 echo
 echo "All long-CoT runs completed."

@@ -13,10 +13,11 @@ from transformers import Trainer
 
 
 METHOD_ALIASES = {
-    "INP-OH": "INP_OH",
-    "INPOH": "INP_OH",
+    "INP-OH": "SFT",
+    "INPOH": "SFT",
+    "INP_OH": "SFT",
 }
-VALID_METHODS = {"INP_OH"}
+VALID_METHODS = {"SFT"}
 T_SAMPLING_MODE_ALIASES = {
     "biased-to-one": "biased_to_one",
     "biasedtoone": "biased_to_one",
@@ -36,7 +37,7 @@ def _normalize_method_name(method: str) -> str:
 
 
 def normalize_training_method(method: str) -> str:
-    normalized = _normalize_method_name(method) or "INP_OH"
+    normalized = _normalize_method_name(method) or "SFT"
     if normalized not in VALID_METHODS:
         valid = ", ".join(sorted(VALID_METHODS))
         raise ValueError(f"Unsupported method `{method}`. Expected one of: {valid}.")
@@ -100,7 +101,7 @@ class BatchMetrics:
 
 class DiffuSelfDistillDataCollator:
     """
-    Tokenize prompts and target responses for INP-OH training.
+    Tokenize prompts and target responses for SFT training.
     """
 
     def __init__(
@@ -280,7 +281,7 @@ class DiffuSelfDistillTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.dataset_name = str(getattr(self.args, "dataset", "")).strip().lower()
-        self.method = normalize_training_method(getattr(self.args, "method", "INP_OH"))
+        self.method = normalize_training_method(getattr(self.args, "method", "SFT"))
         self.args.method = self.method
         if getattr(self.args, "disable_dropout", False):
             disable_dropout_in_model(self.model)
@@ -365,7 +366,7 @@ class DiffuSelfDistillTrainer(Trainer):
             "avg_response_length": 0.0,
             "masked_tokens": 0.0,
             "student_masked_tokens": 0.0,
-            "batch_inp_oh_frac": 0.0,
+            "batch_sft_frac": 0.0,
         }
 
     def _accumulate_interval_log_metrics(
@@ -384,7 +385,7 @@ class DiffuSelfDistillTrainer(Trainer):
         self._interval_log_sums["avg_response_length"] += float(metrics.avg_response_length)
         self._interval_log_sums["masked_tokens"] += float(metrics.num_masked_tokens)
         self._interval_log_sums["student_masked_tokens"] += float(metrics.num_student_masked_tokens)
-        self._interval_log_sums["batch_inp_oh_frac"] += 1.0
+        self._interval_log_sums["batch_sft_frac"] += 1.0
 
     def log(self, logs: dict[str, float], *args, **kwargs):
         log_payload = dict(logs)
@@ -837,7 +838,7 @@ class DiffuSelfDistillTrainer(Trainer):
             avg_response_length=response_lengths.mean().item(),
             num_masked_tokens=inputs["kd_mask"].float().sum().item(),
             num_student_masked_tokens=inputs["kd_mask"].float().sum().item(),
-            method_fractions={"INP_OH": 1.0},
+            method_fractions={"SFT": 1.0},
         )
 
     def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch=None):

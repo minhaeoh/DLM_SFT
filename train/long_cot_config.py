@@ -7,10 +7,10 @@ from transformers import TrainingArguments
 @dataclass
 class DiffuSelfDistillConfig(TrainingArguments):
     """
-    Training configuration for long-CoT INP-OH training.
+    Training configuration for long-CoT SFT training.
 
     This trainer is intentionally narrow:
-    - only `method=INP_OH` is supported
+    - only `method=SFT` is supported
     - the main loss is masked-token cross entropy on the noisy target response
     - optional auxiliary CE, when enabled, is always applied over the full response
     - there is no teacher prompt / teacher forward branch
@@ -63,9 +63,9 @@ class DiffuSelfDistillConfig(TrainingArguments):
         metadata={"help": "Optional cap for eval dataset size (debug/smoke runs)."},
     )
     method: str = field(
-        default="INP_OH",
+        default="SFT",
         metadata={
-            "help": "Compatibility flag. Only INP_OH is supported by this trainer."
+            "help": "Compatibility flag. `SFT` is the canonical method name; legacy INP_OH aliases are still accepted."
         },
     )
 

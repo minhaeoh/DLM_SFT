@@ -4,6 +4,7 @@ __pycache__/
 logs/
 datasets/
 wandb/
+eval/eval_results/
 
-*.json
-*.jsonl
+*.local.sh
+*.local.bash

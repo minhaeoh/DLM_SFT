@@ -19,11 +19,11 @@ fi
 # Edit these values as needed.
 MODEL_PATH="${MODEL_PATH:-GSAI-ML/LLaDA-8B-Base}"
 MODEL_LABEL="${MODEL_PATH##*/}"
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/minhae/diffusion/DLM_SFT/checkpoints/Math-CoT-NoCoT-20k-format-4096/LLaDA-8B-Base/BS16_math_ff_4096_SFT_tgtnoncot_answer_first_prompt_promptanswer_first_ep8_20260508_153129/checkpoint-752}"
 TASK="${TASK:-math}"
 GEN_LENGTH="${GEN_LENGTH:-512}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
-OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/eval_results/${TASK}/baselines}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/eval_results/${TASK}/${MODEL_LABEL}/SFT_tgtnoncot_answerfirst}"
 SUFFIX="${SUFFIX:-newline_later_early_stop}"
 FEW_SHOT="${FEW_SHOT:-0}"
 SUBSAMPLE="${SUBSAMPLE:--1}"

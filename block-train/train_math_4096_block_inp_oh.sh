@@ -152,10 +152,9 @@ echo "========================================"
 
 run_experiment() {
   local method="$1"
-  local reference_source="$2"
-  local target_source="$3"
-  local run_index="$4"
-  shift 4
+  local target_source="$2"
+  local run_index="$3"
+  shift 3
   local extra_train_args=("$@")
   local normalized_method=""
   local effective_block_size="${BLOCK_SIZE}"
@@ -199,7 +198,7 @@ run_experiment() {
 
   normalized_method="$(printf '%s' "${method}" | tr '[:lower:]-' '[:upper:]_')"
 
-  local run_method_label="${normalized_method}_ref${reference_source}_tgt${target_source}_bsz${effective_block_size}"
+  local run_method_label="${normalized_method}_tgt${target_source}_bsz${effective_block_size}"
   case "${effective_t_sampling_mode}" in
     uniform)
       ;;
@@ -229,7 +228,6 @@ run_experiment() {
   echo "Starting run                 : ${run_name}"
   echo "METHOD                       : ${method}"
   echo "RUN_METHOD_LABEL             : ${run_method_label}"
-  echo "REFERENCE_RESPONSE_SOURCE    : ${reference_source}"
   echo "TARGET_RESPONSE_SOURCE       : ${target_source}"
   echo "EFFECTIVE_BLOCK_SIZE         : ${effective_block_size}"
   echo "EFFECTIVE_T_SAMPLING_MODE    : ${effective_t_sampling_mode}"
@@ -253,7 +251,6 @@ run_experiment() {
     --dataset "${DATASET_LABEL}"
     --dataset_path "${DATASET_PATH}"
     --method "${method}"
-    --reference_response_source "${reference_source}"
     --target_response_source "${target_source}"
     --output_dir "${output_dir}"
     --run_name "${run_name}"
@@ -308,13 +305,12 @@ run_experiment() {
 }
 
 # The block diffusion trainer currently only supports INP-OH.
-# We keep reference=target here so the run list stays easy to scan.
-run_experiment "INP_OH" "noncot" "noncot" 0
-run_experiment "INP_OH" "cot" "cot" 1
-# run_experiment "INP_OH" "noncot" "noncot" 2 \
+run_experiment "INP_OH" "noncot" 0
+run_experiment "INP_OH" "cot" 1
+# run_experiment "INP_OH" "noncot" 2 \
 #   --t_sampling_mode=biased_to_one \
 #   --t_biased_to_one_strength=2.0
-# run_experiment "INP_OH" "cot" "cot" 3 \
+# run_experiment "INP_OH" "cot" 3 \
 #   --t_sampling_mode=biased_to_one \
 #   --t_biased_to_one_strength=2.0
 

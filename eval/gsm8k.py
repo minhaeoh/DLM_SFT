@@ -13,9 +13,32 @@ Your reasoning here
 \\boxed{...}
 </answer>"""
 
-LONG_COT_SYSTEM_PROMPT = """
+RAW_SYSTEM_PROMPT = """
 Please reason step by step, and put your final answer within \\boxed{}.
 """
+
+FORMAT_SYSTEM_PROMPT = """
+Please reason step by step and respond in the following format, with the final answer inside \boxed{}:
+
+<reasoning>
+...
+</reasoning>
+<answer>
+...
+</answer>
+"""
+
+ANSWER_FIRST_SYSTEM_PROMPT = """
+Please reason step by step, but respond with the final answer first inside \boxed{}, followed by the reasoning:
+
+<answer>
+...
+</answer>
+<reasoning>
+...
+</reasoning>
+"""
+
 
 class GSM8KDataset(torch.utils.data.Dataset):
     def __init__(
@@ -50,10 +73,24 @@ class GSM8KDataset(torch.utils.data.Dataset):
         self.dataset = load_dataset("gsm8k", "main", split="test")
 
     def create_prompt(self, input_text):
-        if self.prompt_style == "raw_long_cot":
+        if self.prompt_style == "raw":
             user_prompt = (
                 f"{input_text}"
-                f"{LONG_COT_SYSTEM_PROMPT}\n\n"
+                f"{RAW_SYSTEM_PROMPT}\n\n"
+            )
+            messages = [{"role": "user", "content": user_prompt}]
+            return self.tokenizer.apply_chat_template(messages, tokenize=False) + "\n"
+        if self.prompt_style == "format":
+            user_prompt = (
+                f"{input_text}"
+                f"{FORMAT_SYSTEM_PROMPT}\n\n"
+            )
+            messages = [{"role": "user", "content": user_prompt}]
+            return self.tokenizer.apply_chat_template(messages, tokenize=False) + "\n"
+        if self.prompt_style == "answer_first":
+            user_prompt = (
+                f"{input_text}"
+                f"{ANSWER_FIRST_SYSTEM_PROMPT}\n\n"
             )
             messages = [{"role": "user", "content": user_prompt}]
             return self.tokenizer.apply_chat_template(messages, tokenize=False) + "\n"
