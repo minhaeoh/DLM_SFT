@@ -6,5 +6,6 @@ datasets/
 wandb/
 eval/eval_results/
 
+*.log
 *.local.sh
 *.local.bash

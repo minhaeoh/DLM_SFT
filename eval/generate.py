@@ -59,6 +59,15 @@ def _uses_block_attention(model):
     return isinstance(model_type, str) and "llada2" in model_type
 
 
+def _get_single_token_id(tokenizer, text):
+    try:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    return token_ids[0] if len(token_ids) == 1 else None
+
+
 def _resolve_stop_token_ids(tokenizer, pad_token_id):
     stop_token_ids = set()
     for token_id in (getattr(tokenizer, "eos_token_id", None), pad_token_id):
@@ -75,6 +84,27 @@ def _resolve_stop_token_ids(tokenizer, pad_token_id):
     return stop_token_ids
 
 
+def _find_repeated_token_run_start(token_ids, token_id, run_length):
+    if token_id is None or run_length <= 0:
+        return None, None
+
+    seq_length = token_ids.shape[1]
+    if seq_length < run_length:
+        return None, None
+
+    token_mask = token_ids.eq(token_id)
+    run_mask = token_mask[:, : seq_length - run_length + 1].clone()
+    for offset in range(1, run_length):
+        run_mask &= token_mask[:, offset : offset + run_mask.shape[1]]
+
+    has_run = run_mask.any(dim=1)
+    if not has_run.any():
+        return None, None
+
+    first_run_offsets = run_mask.to(torch.int64).argmax(dim=1)
+    return has_run, first_run_offsets
+
+
 def _build_stop_mask(token_ids, stop_token_ids):
     if stop_token_ids is None or stop_token_ids.numel() == 0:
         return torch.zeros_like(token_ids, dtype=torch.bool)
@@ -85,19 +115,102 @@ def _build_stop_mask(token_ids, stop_token_ids):
     return stop_mask
 
 
-def _update_stop_positions(x, prompt_length, stop_token_ids, stop_positions):
-    if stop_token_ids is None or stop_token_ids.numel() == 0:
-        return stop_positions
-
+def _update_stop_positions(
+    x,
+    prompt_length,
+    stop_token_ids,
+    stop_positions,
+    newline_token_id=None,
+    newline_run_length=10,
+):
     generated_tokens = x[:, prompt_length:]
-    stop_mask = _build_stop_mask(generated_tokens, stop_token_ids)
-    has_stop = stop_mask.any(dim=1)
-    if not has_stop.any():
-        return stop_positions
+    updated_stop_positions = stop_positions
 
-    first_stop_offsets = stop_mask.to(torch.int64).argmax(dim=1)
-    first_stop_positions = prompt_length + first_stop_offsets
-    return torch.where(has_stop, torch.minimum(stop_positions, first_stop_positions), stop_positions)
+    if stop_token_ids is not None and stop_token_ids.numel() > 0:
+        stop_mask = _build_stop_mask(generated_tokens, stop_token_ids)
+        has_stop = stop_mask.any(dim=1)
+        if has_stop.any():
+            first_stop_offsets = stop_mask.to(torch.int64).argmax(dim=1)
+            first_stop_positions = prompt_length + first_stop_offsets
+            updated_stop_positions = torch.where(
+                has_stop,
+                torch.minimum(updated_stop_positions, first_stop_positions),
+                updated_stop_positions,
+            )
+
+    has_newline_run, first_newline_offsets = _find_repeated_token_run_start(
+        generated_tokens,
+        token_id=newline_token_id,
+        run_length=newline_run_length,
+    )
+    if has_newline_run is not None and first_newline_offsets is not None:
+        first_newline_positions = prompt_length + first_newline_offsets
+        updated_stop_positions = torch.where(
+            has_newline_run,
+            torch.minimum(updated_stop_positions, first_newline_positions),
+            updated_stop_positions,
+        )
+
+    return updated_stop_positions
+
+
+def _mask_stopped_tokens(x, stop_positions, mask_id):
+    sequence_positions = torch.arange(x.shape[1], device=x.device)
+    stopped_positions = sequence_positions.unsqueeze(0) >= stop_positions.unsqueeze(1)
+    return x.masked_fill(stopped_positions, mask_id)
+
+
+def _select_transfer_indices(
+    confidence_row,
+    active_mask_row,
+    predicted_token_row,
+    start_idx,
+    end_idx,
+    num_tokens,
+    newline_token_id=None,
+    newline_later=False,
+):
+    if num_tokens <= 0:
+        return None
+
+    if not newline_later or newline_token_id is None:
+        available_tokens = int(torch.isfinite(confidence_row).sum().item())
+        if available_tokens == 0:
+            return None
+
+        num_tokens = min(num_tokens, available_tokens)
+        _, select_indices = torch.topk(confidence_row, k=num_tokens)
+        return select_indices
+
+    block_positions = torch.arange(start_idx, end_idx, device=confidence_row.device)
+    block_mask = active_mask_row[start_idx:end_idx]
+    candidate_indices = block_positions[block_mask]
+
+    if candidate_indices.numel() == 0:
+        return None
+
+    candidate_token_ids = predicted_token_row[candidate_indices]
+    newline_mask = candidate_token_ids.eq(newline_token_id)
+    normal_candidate_indices = candidate_indices[~newline_mask]
+    newline_candidate_indices = candidate_indices[newline_mask]
+    selected_parts = []
+
+    # Prefer non-newline predictions and only backfill with newlines if needed.
+    if normal_candidate_indices.numel() > 0:
+        normal_k = min(num_tokens, normal_candidate_indices.numel())
+        _, normal_order = torch.topk(confidence_row[normal_candidate_indices], k=normal_k)
+        selected_parts.append(normal_candidate_indices[normal_order])
+
+    remaining = num_tokens - sum(part.numel() for part in selected_parts)
+    if remaining > 0 and newline_candidate_indices.numel() > 0:
+        newline_k = min(remaining, newline_candidate_indices.numel())
+        _, newline_order = torch.topk(confidence_row[newline_candidate_indices], k=newline_k)
+        selected_parts.append(newline_candidate_indices[newline_order])
+
+    if not selected_parts:
+        return None
+
+    return torch.cat(selected_parts)
 
 
 def _build_block_attention_mask(input_ids, pad_token_id, dtype):
@@ -125,6 +238,9 @@ def generate(
     cfg_scale=0.0,
     remasking="low_confidence",
     mask_id=126336,
+    newline_later=False,
+    earlystop=False,
+    newline_run_length=10,
 ):
     """
     Optimized version of the generate function.
@@ -135,6 +251,7 @@ def generate(
 
     use_block_attention = _uses_block_attention(model)
     attention_mask_dtype = _get_model_attention_mask_dtype(model) if use_block_attention else None
+    newline_token_id = _get_single_token_id(tokenizer, "\n") if (newline_later or earlystop) else None
 
     # Use mixed precision for faster computation
     with torch.autocast(device_type="cuda"):
@@ -147,7 +264,7 @@ def generate(
 
         prompt_index = x.ne(mask_id) & x.ne(pad_token_id)
         sequence_positions = torch.arange(total_length, device=prompt.device)
-        stop_token_ids = _resolve_stop_token_ids(tokenizer, pad_token_id)
+        stop_token_ids = _resolve_stop_token_ids(tokenizer, pad_token_id) if earlystop else set()
         stop_token_ids_tensor = (
             torch.tensor(sorted(stop_token_ids), device=prompt.device, dtype=torch.long) if stop_token_ids else None
         )
@@ -167,15 +284,17 @@ def generate(
             end_idx = prompt_length + (num_block + 1) * block_length
 
             block_positions = sequence_positions[start_idx:end_idx]
-            block_mask_index = (x[:, start_idx:end_idx] == mask_id) & (
-                block_positions.unsqueeze(0) < stop_positions.unsqueeze(1)
-            )
+            block_mask_index = x[:, start_idx:end_idx] == mask_id
+            if earlystop:
+                block_mask_index &= block_positions.unsqueeze(0) < stop_positions.unsqueeze(1)
             if not block_mask_index.any():
                 break
             num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
             for i in range(steps_per_block):
-                allowed_mask_index = (x == mask_id) & (sequence_positions.unsqueeze(0) < stop_positions.unsqueeze(1))
+                allowed_mask_index = x == mask_id
+                if earlystop:
+                    allowed_mask_index &= sequence_positions.unsqueeze(0) < stop_positions.unsqueeze(1)
                 active_rows = allowed_mask_index.any(dim=1)
                 if not active_rows.any():
                     should_stop_generation = True
@@ -228,22 +347,30 @@ def generate(
                 # Select tokens to transfer based on confidence
                 active_row_indices = torch.nonzero(active_rows, as_tuple=False).squeeze(1)
                 for active_j, row_idx in enumerate(active_row_indices.tolist()):
-                    num_tokens = num_transfer_tokens[row_idx, i].item()
-                    if num_tokens > 0:
-                        available_tokens = int(torch.isfinite(confidence[active_j]).sum().item())
-                        if available_tokens == 0:
-                            continue
+                    select_indices = _select_transfer_indices(
+                        confidence_row=confidence[active_j],
+                        active_mask_row=active_mask_index[active_j],
+                        predicted_token_row=x0[active_j],
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        num_tokens=num_transfer_tokens[row_idx, i].item(),
+                        newline_token_id=newline_token_id,
+                        newline_later=newline_later,
+                    )
+                    if select_indices is None:
+                        continue
+                    x[row_idx, select_indices] = x0[active_j, select_indices]
 
-                        num_tokens = min(num_tokens, available_tokens)
-                        _, select_indices = torch.topk(confidence[active_j], k=num_tokens)
-                        x[row_idx, select_indices] = x0[active_j, select_indices]
-
-                stop_positions = _update_stop_positions(
-                    x,
-                    prompt_length=prompt_length,
-                    stop_token_ids=stop_token_ids_tensor,
-                    stop_positions=stop_positions,
-                )
+                if earlystop:
+                    stop_positions = _update_stop_positions(
+                        x,
+                        prompt_length=prompt_length,
+                        stop_token_ids=stop_token_ids_tensor,
+                        stop_positions=stop_positions,
+                        newline_token_id=newline_token_id,
+                        newline_run_length=newline_run_length,
+                    )
+                    x = _mask_stopped_tokens(x, stop_positions=stop_positions, mask_id=mask_id)
             if should_stop_generation:
                 break
         return x

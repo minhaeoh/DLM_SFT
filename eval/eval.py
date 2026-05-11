@@ -21,11 +21,10 @@ import transformers.modeling_rope_utils as rope_utils
 import transformers.utils as transformers_utils
 from transformers import AutoConfig, AutoTokenizer, AutoModel, AutoModelForCausalLM
 
-from generate_newline_later import generate
-# from generate import generate
+from generate import generate
 from gsm8k import GSM8KDataset
 from math500 import MATH500Dataset
-from parser_helper import is_equiv, last_boxed_only_string, remove_boxed
+from parser_helper import is_equiv, last_boxed_only_string, first_boxed_only_string, remove_boxed
 
 
 def ensure_dynamic_rope_compat():
@@ -167,13 +166,18 @@ def resolve_stop_token_ids(tokenizer) -> set[int]:
     return stop_token_ids
 
 
-def decode_generated_texts(tokenizer, generated_token_ids: torch.Tensor) -> list[str]:
+def decode_generated_texts(
+    tokenizer,
+    generated_token_ids: torch.Tensor,
+    mask_id: int,
+    truncate_at_mask: bool = False,
+) -> list[str]:
     stop_token_ids = resolve_stop_token_ids(tokenizer)
     decoded_texts = []
     for token_ids in generated_token_ids.tolist():
         cutoff = len(token_ids)
         for idx, token_id in enumerate(token_ids):
-            if token_id in stop_token_ids:
+            if (truncate_at_mask and token_id == mask_id) or token_id in stop_token_ids:
                 cutoff = idx
                 break
         decoded_texts.append(
@@ -200,20 +204,40 @@ def _extract_number(text, use_last_match=False):
     return None
 
 
-def _truncate_generation_at_eot(raw_generation):
+def _truncate_generation_at_stop(
+    raw_generation,
+    truncate_repeated_newlines: bool = False,
+    newline_run_length: int = 10,
+):
     text = raw_generation or ""
     eot_marker = "<|eot_id|>"
     if eot_marker in text:
         text = text.split(eot_marker, 1)[0]
+    if truncate_repeated_newlines and newline_run_length > 0:
+        repeated_newlines = re.compile(r"(?:\n){" + str(newline_run_length) + r",}")
+        match = repeated_newlines.search(text)
+        if match:
+            text = text[:match.start()]
     return text
 
 
-def extract_gsm8k_answer(raw_generation):
-    truncated_generation = _truncate_generation_at_eot(raw_generation)
+def extract_gsm8k_answer(
+    raw_generation,
+    prompt_style: str = "default",
+    truncate_repeated_newlines: bool = False,
+):
+    truncated_generation = _truncate_generation_at_stop(
+        raw_generation,
+        truncate_repeated_newlines=truncate_repeated_newlines,
+    )
 
-    boxed_matches = re.findall(r"\\boxed{(.*?)}", truncated_generation)
-    for boxed_content in boxed_matches:
-        boxed_content = boxed_content.strip()
+    if "\\boxed" in truncated_generation or "\\fbox" in truncated_generation:
+        boxed_string = (
+            first_boxed_only_string(truncated_generation)
+            if prompt_style == "answer_first"
+            else last_boxed_only_string(truncated_generation)
+        )
+        boxed_content = str(remove_boxed(boxed_string or "")).strip()
         if boxed_content and boxed_content != "..." and not re.match(r"^\.+$", boxed_content):
             parsed_answer = _extract_number(boxed_content)
             if parsed_answer is not None:
@@ -226,12 +250,20 @@ def extract_gsm8k_answer(raw_generation):
     return None
 
 
-def compute_gsm8k_accuracy(generations):
+def compute_gsm8k_accuracy(
+    generations,
+    prompt_style: str = "default",
+    truncate_repeated_newlines: bool = False,
+):
     correct = 0
     processed = len(generations)
 
     for item in generations:
-        parsed_answer = extract_gsm8k_answer(item.get("generations", ""))
+        parsed_answer = extract_gsm8k_answer(
+            item.get("generations", ""),
+            prompt_style=prompt_style,
+            truncate_repeated_newlines=truncate_repeated_newlines,
+        )
         is_correct = parsed_answer is not None and parsed_answer == item.get("ground_truth")
         item["parsed_answer"] = parsed_answer
         item["correct"] = is_correct
@@ -242,12 +274,24 @@ def compute_gsm8k_accuracy(generations):
     return {"correct": correct, "processed": processed, "accuracy": accuracy}
 
 
-def extract_math_answer(raw_generation):
-    truncated_generation = _truncate_generation_at_eot(raw_generation)
+def extract_math_answer(
+    raw_generation,
+    prompt_style: str = "default",
+    truncate_repeated_newlines: bool = False,
+):
+    truncated_generation = _truncate_generation_at_stop(
+        raw_generation,
+        truncate_repeated_newlines=truncate_repeated_newlines,
+    )
     parsed_answer = None
 
     try:
-        parsed_answer = remove_boxed(last_boxed_only_string(truncated_generation))
+        boxed_string = (
+            first_boxed_only_string(truncated_generation)
+            if prompt_style == "answer_first"
+            else last_boxed_only_string(truncated_generation)
+        )
+        parsed_answer = remove_boxed(boxed_string)
     except Exception:
         parsed_answer = None
 
@@ -256,19 +300,32 @@ def extract_math_answer(raw_generation):
         if answer_match:
             answer_text = answer_match.group(1).strip()
             try:
-                parsed_answer = remove_boxed(last_boxed_only_string(answer_text))
+                boxed_string = (
+                    first_boxed_only_string(answer_text)
+                    if prompt_style == "answer_first"
+                    else last_boxed_only_string(answer_text)
+                )
+                parsed_answer = remove_boxed(boxed_string)
             except Exception:
                 parsed_answer = "<unparsed>"
 
     return parsed_answer
 
 
-def compute_math_accuracy(generations):
+def compute_math_accuracy(
+    generations,
+    prompt_style: str = "default",
+    truncate_repeated_newlines: bool = False,
+):
     correct = 0
     processed = len(generations)
 
     for item in generations:
-        parsed_answer = extract_math_answer(item.get("generations", ""))
+        parsed_answer = extract_math_answer(
+            item.get("generations", ""),
+            prompt_style=prompt_style,
+            truncate_repeated_newlines=truncate_repeated_newlines,
+        )
         is_correct = parsed_answer is not None and is_equiv(parsed_answer, item.get("ground_truth", ""))
         item["parsed_answer"] = parsed_answer
         item["correct"] = is_correct
@@ -319,11 +376,24 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def annotate_generation_results(dataset_name, generations):
+def annotate_generation_results(
+    dataset_name,
+    generations,
+    prompt_style: str = "default",
+    truncate_repeated_newlines: bool = False,
+):
     if dataset_name == "gsm8k":
-        compute_gsm8k_accuracy(generations)
+        compute_gsm8k_accuracy(
+            generations,
+            prompt_style=prompt_style,
+            truncate_repeated_newlines=truncate_repeated_newlines,
+        )
     elif dataset_name == "math":
-        compute_math_accuracy(generations)
+        compute_math_accuracy(
+            generations,
+            prompt_style=prompt_style,
+            truncate_repeated_newlines=truncate_repeated_newlines,
+        )
     else:
         raise ValueError(f"Unsupported dataset `{dataset_name}` in standalone eval package.")
 
@@ -375,6 +445,9 @@ def evaluate(
     block_length=32,
     mask_id=126336,
     max_context_length=None,
+    prompt_style="default",
+    newline_later=False,
+    earlystop=False,
 ):
     model.eval()
     device = next(model.parameters()).device
@@ -425,9 +498,16 @@ def evaluate(
             cfg_scale=cfg_scale,
             remasking="low_confidence",
             mask_id=mask_id,
+            newline_later=newline_later,
+            earlystop=earlystop,
         )
 
-        generated_texts = decode_generated_texts(tokenizer, out[:, -effective_gen_length:])
+        generated_texts = decode_generated_texts(
+            tokenizer,
+            out[:, -effective_gen_length:],
+            mask_id=mask_id,
+            truncate_at_mask=earlystop,
+        )
         example_result = [
             {
                 "question": questions[j],
@@ -437,7 +517,12 @@ def evaluate(
             }
             for j in range(len(gt_answers))
         ]
-        annotate_generation_results(dataset_name, example_result)
+        annotate_generation_results(
+            dataset_name,
+            example_result,
+            prompt_style=prompt_style,
+            truncate_repeated_newlines=earlystop,
+        )
         all_generations.extend(example_result)
         total_processed += len(generated_texts)
         wall_times.append(time.time() - start_time)
@@ -524,7 +609,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="/data1/shared/LLaDA-8B-Instruct/")
-    parser.add_argument("--few_shot", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument(
         "--dataset",
@@ -537,14 +621,11 @@ if __name__ == "__main__":
     parser.add_argument("--gen_length", type=int, default=128)
     parser.add_argument("--block_length", type=int, default=32)
     parser.add_argument("--diffusion_steps", type=int, default=64)
-    parser.add_argument("--add_reasoning", dest="add_reasoning", action="store_true")
-    parser.add_argument("--no_add_reasoning", dest="add_reasoning", action="store_false")
-    parser.set_defaults(add_reasoning=True)
     parser.add_argument(
         "--prompt_style",
         type=str,
-        choices=["xml", "raw_long_cot", "answer_first"],
-        default="xml",
+        choices=["default", "format", "answer_first"],
+        default="default",
         help="Prompt format used to build eval inputs.",
     )
     parser.add_argument(
@@ -559,6 +640,8 @@ if __name__ == "__main__":
         default=None,
         help="Optional total prompt+generation budget used for overflow warnings.",
     )
+    parser.add_argument("--newline_later", action="store_true")
+    parser.add_argument("--earlystop", action="store_true")
     parser.add_argument("--dont_save", action="store_true")
     parser.add_argument("--output_dir", type=str, default="results/")
     parser.add_argument("--dont_use_box", action="store_true")
@@ -583,7 +666,8 @@ if __name__ == "__main__":
     if get_rank() == 0:
         print(f"Resolved mask_id: {resolved_mask_id}")
         print(f"Prompt style    : {args.prompt_style}")
-        print(f"Reasoning prefill: {args.add_reasoning}")
+        print(f"Newline later   : {args.newline_later}")
+        print(f"Early stop      : {args.earlystop}")
 
     if args.checkpoint_path:
         try:
@@ -604,8 +688,6 @@ if __name__ == "__main__":
     dataset = DATASET_MAP[args.dataset](
         tokenizer,
         subsample=dataset_subsample,
-        num_examples=args.few_shot,
-        add_reasoning=args.add_reasoning,
         prompt_style=args.prompt_style,
     )
 
@@ -619,9 +701,6 @@ if __name__ == "__main__":
     else:
         model_name = args.model_path.split("/")[-1]
         # model_name = "instruct" if "Instruct" in args.model_path else "base"
-
-    if args.few_shot > 0:
-        model_name = model_name + f"_fs{args.few_shot}"
 
     if len(args.suffix) > 0:
         model_name = model_name + f"_{args.suffix}"
@@ -640,17 +719,28 @@ if __name__ == "__main__":
         steps=args.diffusion_steps,
         mask_id=resolved_mask_id,
         max_context_length=args.max_context_length,
+        prompt_style=args.prompt_style,
+        newline_later=args.newline_later,
+        earlystop=args.earlystop,
     )
 
     if args.dataset == "gsm8k":
-        gsm8k_metrics = compute_gsm8k_accuracy(metrics["generations"])
+        gsm8k_metrics = compute_gsm8k_accuracy(
+            metrics["generations"],
+            prompt_style=args.prompt_style,
+            truncate_repeated_newlines=args.earlystop,
+        )
         metrics.update(gsm8k_metrics)
         print(
             f"GSM8K accuracy: {gsm8k_metrics['correct']}/{gsm8k_metrics['processed']} "
             f"({gsm8k_metrics['accuracy']:.2f}%)"
         )
     elif args.dataset == "math":
-        math_metrics = compute_math_accuracy(metrics["generations"])
+        math_metrics = compute_math_accuracy(
+            metrics["generations"],
+            prompt_style=args.prompt_style,
+            truncate_repeated_newlines=args.earlystop,
+        )
         metrics.update(math_metrics)
         print(
             f"{args.dataset.upper()} accuracy: {math_metrics['correct']}/{math_metrics['processed']} "
@@ -676,6 +766,9 @@ if __name__ == "__main__":
                     "gen_length": args.gen_length,
                     "diffusion_steps": args.diffusion_steps,
                     "block_length": args.block_length,
+                    "prompt_style": args.prompt_style,
+                    "newline_later": args.newline_later,
+                    "earlystop": args.earlystop,
                 },
                 f,
                 indent=2,

@@ -7,11 +7,11 @@ from datasets import Dataset, DatasetDict, load_from_disk
 
 
 DEFAULT_PROMPT = """
-Please reason step by step, and put your final answer within \boxed{}.
+Please reason step by step, and put your final answer within \\boxed{}.
 """
 
 FORMAT_PROMPT = """
-Please reason step by step and respond in the following format, with the final answer inside \boxed{}:
+Please reason step by step and respond in the following format, with the final answer inside \\boxed{}:
 
 <reasoning>
 ...
@@ -22,7 +22,7 @@ Please reason step by step and respond in the following format, with the final a
 """
 
 ANSWER_FIRST_PROMPT = """
-Please reason step by step, but respond with the final answer first inside \boxed{}, followed by the reasoning:
+Please reason step by step, but respond with the final answer first inside \\boxed{}, followed by the reasoning:
 
 <answer>
 ...

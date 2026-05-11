@@ -24,14 +24,14 @@ TASK="${TASK:-math}"
 GEN_LENGTH="${GEN_LENGTH:-512}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/eval_results/${TASK}/${MODEL_LABEL}/SFT_tgtnoncot_answerfirst}"
-SUFFIX="${SUFFIX:-newline_later_early_stop}"
-FEW_SHOT="${FEW_SHOT:-0}"
+SUFFIX="${SUFFIX:-}"
 SUBSAMPLE="${SUBSAMPLE:--1}"
 DIFFUSION_STEPS="${DIFFUSION_STEPS:-512}"
 BLOCK_LENGTH="${BLOCK_LENGTH:-32}"
-PROMPT_STYLE="${PROMPT_STYLE:-raw_long_cot}"
-REASONING_PREFILL="${REASONING_PREFILL:-0}"
+PROMPT_STYLE="${PROMPT_STYLE:-format}"
 MAX_CONTEXT_LENGTH="${MAX_CONTEXT_LENGTH:-4096}"
+NEWLINE_LATER="${NEWLINE_LATER:-1}"
+EARLYSTOP="${EARLYSTOP:-1}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/logs}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/${TASK}_$(date +%Y%m%d_%H%M%S).log}"
 
@@ -92,11 +92,29 @@ echo "  SUBSAMPLE      : ${SUBSAMPLE}"
 echo "  DIFFUSION_STEPS: ${DIFFUSION_STEPS}"
 echo "  BLOCK_LENGTH   : ${BLOCK_LENGTH}"
 echo "  PROMPT_STYLE   : ${PROMPT_STYLE}"
-echo "  REASONING_PREFILL: ${REASONING_PREFILL}"
 echo "  MAX_CONTEXT_LENGTH: ${MAX_CONTEXT_LENGTH}"
+echo "  NEWLINE_LATER  : ${NEWLINE_LATER}"
+echo "  EARLYSTOP      : ${EARLYSTOP}"
 echo "  LOG_FILE       : ${LOG_FILE}"
 run_eval_for_checkpoint() {
   local checkpoint_path="$1"
+  local effective_suffix="${SUFFIX}"
+
+  if [[ "${NEWLINE_LATER}" == "1" ]]; then
+    if [[ -n "${effective_suffix}" ]]; then
+      effective_suffix+="_newline_later"
+    else
+      effective_suffix="newline_later"
+    fi
+  fi
+
+  if [[ "${EARLYSTOP}" == "1" ]]; then
+    if [[ -n "${effective_suffix}" ]]; then
+      effective_suffix+="_earlystop"
+    else
+      effective_suffix="earlystop"
+    fi
+  fi
 
   local -a CMD=(
     "${PYTHON_BIN}"
@@ -105,8 +123,7 @@ run_eval_for_checkpoint() {
     --model_path "${MODEL_PATH}"
     --batch_size "${BATCH_SIZE}"
     --gen_length "${GEN_LENGTH}"
-    --few_shot "${FEW_SHOT}"
-    --suffix "${SUFFIX}"
+    --suffix "${effective_suffix}"
     --output_dir "${OUTPUT_DIR}"
     --subsample "${SUBSAMPLE}"
     --diffusion_steps "${DIFFUSION_STEPS}"
@@ -115,10 +132,12 @@ run_eval_for_checkpoint() {
     --max_context_length "${MAX_CONTEXT_LENGTH}"
   )
 
-  if [[ "${REASONING_PREFILL}" == "1" ]]; then
-    CMD+=(--add_reasoning)
-  else
-    CMD+=(--no_add_reasoning)
+  if [[ "${NEWLINE_LATER}" == "1" ]]; then
+    CMD+=(--newline_later)
+  fi
+
+  if [[ "${EARLYSTOP}" == "1" ]]; then
+    CMD+=(--earlystop)
   fi
 
   if [[ -n "${checkpoint_path}" ]]; then
@@ -127,6 +146,7 @@ run_eval_for_checkpoint() {
 
   echo "----------------------------------------"
   echo "[eval] checkpoint_path=${checkpoint_path:-<none>}"
+  echo "[eval] suffix=${effective_suffix:-<none>}"
   "${CMD[@]}"
 }
 
