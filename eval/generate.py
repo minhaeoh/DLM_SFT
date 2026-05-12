@@ -60,65 +60,79 @@ def _uses_block_attention(model):
 
 
 def _get_single_token_id(tokenizer, text):
+    token_ids = _get_token_ids(tokenizer, text)
+    return token_ids[0] if len(token_ids) == 1 else None
+
+
+def _get_token_ids(tokenizer, text):
     try:
         token_ids = tokenizer.encode(text, add_special_tokens=False)
     except TypeError:
         token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
 
-    return token_ids[0] if len(token_ids) == 1 else None
+    return [int(token_id) for token_id in token_ids]
 
 
-def _resolve_stop_token_ids(tokenizer, pad_token_id):
-    stop_token_ids = set()
+def _resolve_stop_token_sequences(tokenizer, pad_token_id):
+    stop_token_sequences = []
+    seen_sequences = set()
+
+    def add_sequence(token_ids):
+        sequence = tuple(int(token_id) for token_id in token_ids if token_id is not None and int(token_id) >= 0)
+        if not sequence or sequence in seen_sequences:
+            return
+        seen_sequences.add(sequence)
+        stop_token_sequences.append(sequence)
+
     for token_id in (getattr(tokenizer, "eos_token_id", None), pad_token_id):
         if token_id is not None and token_id >= 0:
-            stop_token_ids.add(int(token_id))
+            add_sequence([token_id])
 
     convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
     if callable(convert_tokens_to_ids):
         for special_token in ("<|eot_id|>",):
             token_id = convert_tokens_to_ids(special_token)
             if token_id is not None and token_id >= 0 and token_id != getattr(tokenizer, "unk_token_id", None):
-                stop_token_ids.add(int(token_id))
+                add_sequence([token_id])
 
-    return stop_token_ids
+    # Some tokenizers render `<|eot_id|>` as plain text instead of a single special token.
+    add_sequence(_get_token_ids(tokenizer, "<|eot_id|>"))
+    return stop_token_sequences
+
+
+def _find_token_sequence_start(token_ids, token_sequence):
+    if token_sequence is None or token_sequence.numel() == 0:
+        return None, None
+
+    seq_length = token_ids.shape[1]
+    sequence_length = token_sequence.numel()
+    if seq_length < sequence_length:
+        return None, None
+
+    match_mask = token_ids[:, : seq_length - sequence_length + 1].eq(token_sequence[0]).clone()
+    for offset in range(1, sequence_length):
+        match_mask &= token_ids[:, offset : offset + match_mask.shape[1]].eq(token_sequence[offset])
+
+    has_match = match_mask.any(dim=1)
+    if not has_match.any():
+        return None, None
+
+    first_match_offsets = match_mask.to(torch.int64).argmax(dim=1)
+    return has_match, first_match_offsets
 
 
 def _find_repeated_token_run_start(token_ids, token_id, run_length):
     if token_id is None or run_length <= 0:
         return None, None
 
-    seq_length = token_ids.shape[1]
-    if seq_length < run_length:
-        return None, None
-
-    token_mask = token_ids.eq(token_id)
-    run_mask = token_mask[:, : seq_length - run_length + 1].clone()
-    for offset in range(1, run_length):
-        run_mask &= token_mask[:, offset : offset + run_mask.shape[1]]
-
-    has_run = run_mask.any(dim=1)
-    if not has_run.any():
-        return None, None
-
-    first_run_offsets = run_mask.to(torch.int64).argmax(dim=1)
-    return has_run, first_run_offsets
-
-
-def _build_stop_mask(token_ids, stop_token_ids):
-    if stop_token_ids is None or stop_token_ids.numel() == 0:
-        return torch.zeros_like(token_ids, dtype=torch.bool)
-
-    stop_mask = token_ids.eq(stop_token_ids[0])
-    for token_id in stop_token_ids[1:]:
-        stop_mask |= token_ids.eq(token_id)
-    return stop_mask
+    token_sequence = torch.full((run_length,), token_id, dtype=token_ids.dtype, device=token_ids.device)
+    return _find_token_sequence_start(token_ids, token_sequence)
 
 
 def _update_stop_positions(
     x,
     prompt_length,
-    stop_token_ids,
+    stop_token_sequences,
     stop_positions,
     newline_token_id=None,
     newline_run_length=10,
@@ -126,11 +140,9 @@ def _update_stop_positions(
     generated_tokens = x[:, prompt_length:]
     updated_stop_positions = stop_positions
 
-    if stop_token_ids is not None and stop_token_ids.numel() > 0:
-        stop_mask = _build_stop_mask(generated_tokens, stop_token_ids)
-        has_stop = stop_mask.any(dim=1)
-        if has_stop.any():
-            first_stop_offsets = stop_mask.to(torch.int64).argmax(dim=1)
+    for stop_token_sequence in stop_token_sequences or []:
+        has_stop, first_stop_offsets = _find_token_sequence_start(generated_tokens, stop_token_sequence)
+        if has_stop is not None and first_stop_offsets is not None:
             first_stop_positions = prompt_length + first_stop_offsets
             updated_stop_positions = torch.where(
                 has_stop,
@@ -264,10 +276,11 @@ def generate(
 
         prompt_index = x.ne(mask_id) & x.ne(pad_token_id)
         sequence_positions = torch.arange(total_length, device=prompt.device)
-        stop_token_ids = _resolve_stop_token_ids(tokenizer, pad_token_id) if earlystop else set()
-        stop_token_ids_tensor = (
-            torch.tensor(sorted(stop_token_ids), device=prompt.device, dtype=torch.long) if stop_token_ids else None
-        )
+        stop_token_sequences = _resolve_stop_token_sequences(tokenizer, pad_token_id) if earlystop else []
+        stop_token_sequences_tensor = [
+            torch.tensor(token_sequence, device=prompt.device, dtype=torch.long)
+            for token_sequence in stop_token_sequences
+        ]
         stop_positions = torch.full((prompt.shape[0],), total_length, dtype=torch.long, device=prompt.device)
         attention_mask = (
             _build_block_attention_mask(x, pad_token_id=pad_token_id, dtype=attention_mask_dtype)
@@ -365,7 +378,7 @@ def generate(
                     stop_positions = _update_stop_positions(
                         x,
                         prompt_length=prompt_length,
-                        stop_token_ids=stop_token_ids_tensor,
+                        stop_token_sequences=stop_token_sequences_tensor,
                         stop_positions=stop_positions,
                         newline_token_id=newline_token_id,
                         newline_run_length=newline_run_length,

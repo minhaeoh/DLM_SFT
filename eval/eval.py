@@ -152,18 +152,50 @@ def resolve_mask_id(tokenizer, configured_mask_id: int = -1) -> int:
     return 126336
 
 
-def resolve_stop_token_ids(tokenizer) -> set[int]:
-    stop_token_ids: set[int] = set()
+def _encode_without_special_tokens(tokenizer, text: str) -> list[int]:
+    try:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    return [int(token_id) for token_id in token_ids]
+
+
+def resolve_stop_token_sequences(tokenizer) -> list[tuple[int, ...]]:
+    stop_token_sequences: list[tuple[int, ...]] = []
+    seen_sequences: set[tuple[int, ...]] = set()
+
+    def add_sequence(token_ids):
+        sequence = tuple(int(token_id) for token_id in token_ids if token_id is not None and int(token_id) >= 0)
+        if not sequence or sequence in seen_sequences:
+            return
+        seen_sequences.add(sequence)
+        stop_token_sequences.append(sequence)
+
     for token_id in (tokenizer.eos_token_id, tokenizer.pad_token_id):
         if token_id is not None:
-            stop_token_ids.add(int(token_id))
+            add_sequence([token_id])
 
     for special_token in ("<|eot_id|>",):
         token_id = tokenizer.convert_tokens_to_ids(special_token)
         if token_id is not None and token_id >= 0 and token_id != getattr(tokenizer, "unk_token_id", None):
-            stop_token_ids.add(int(token_id))
+            add_sequence([token_id])
 
-    return stop_token_ids
+    add_sequence(_encode_without_special_tokens(tokenizer, "<|eot_id|>"))
+    return stop_token_sequences
+
+
+def _find_first_stop_offset(token_ids: list[int], stop_token_sequences: list[tuple[int, ...]]) -> int | None:
+    first_stop_offset = None
+    for stop_token_sequence in stop_token_sequences:
+        stop_length = len(stop_token_sequence)
+        if stop_length == 0 or len(token_ids) < stop_length:
+            continue
+        for idx in range(len(token_ids) - stop_length + 1):
+            if tuple(token_ids[idx : idx + stop_length]) == stop_token_sequence:
+                if first_stop_offset is None or idx < first_stop_offset:
+                    first_stop_offset = idx
+                break
+    return first_stop_offset
 
 
 def decode_generated_texts(
@@ -172,14 +204,18 @@ def decode_generated_texts(
     mask_id: int,
     truncate_at_mask: bool = False,
 ) -> list[str]:
-    stop_token_ids = resolve_stop_token_ids(tokenizer)
+    stop_token_sequences = resolve_stop_token_sequences(tokenizer)
     decoded_texts = []
     for token_ids in generated_token_ids.tolist():
         cutoff = len(token_ids)
-        for idx, token_id in enumerate(token_ids):
-            if (truncate_at_mask and token_id == mask_id) or token_id in stop_token_ids:
-                cutoff = idx
-                break
+        if truncate_at_mask:
+            try:
+                cutoff = min(cutoff, token_ids.index(mask_id))
+            except ValueError:
+                pass
+        first_stop_offset = _find_first_stop_offset(token_ids, stop_token_sequences)
+        if first_stop_offset is not None:
+            cutoff = min(cutoff, first_stop_offset)
         decoded_texts.append(
             tokenizer.decode(
                 token_ids[:cutoff],
