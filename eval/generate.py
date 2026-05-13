@@ -88,16 +88,35 @@ def _resolve_stop_token_sequences(tokenizer, pad_token_id):
         if token_id is not None and token_id >= 0:
             add_sequence([token_id])
 
-    convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
-    if callable(convert_tokens_to_ids):
-        for special_token in ("<|eot_id|>",):
-            token_id = convert_tokens_to_ids(special_token)
-            if token_id is not None and token_id >= 0 and token_id != getattr(tokenizer, "unk_token_id", None):
-                add_sequence([token_id])
-
-    # Some tokenizers render `<|eot_id|>` as plain text instead of a single special token.
-    add_sequence(_get_token_ids(tokenizer, "<|eot_id|>"))
+    # `<|eot_id|>` is handled via decoded-string matching for robust early stop.
     return stop_token_sequences
+
+
+def _find_first_prefix_with_substring(tokenizer, token_ids, substring):
+    if not token_ids:
+        return None
+
+    full_text = tokenizer.decode(
+        token_ids,
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+    if substring not in full_text:
+        return None
+
+    lo, hi = 0, len(token_ids) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        prefix_text = tokenizer.decode(
+            token_ids[: mid + 1],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        if substring in prefix_text:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
 
 
 def _find_token_sequence_start(token_ids, token_sequence):
@@ -134,6 +153,8 @@ def _update_stop_positions(
     prompt_length,
     stop_token_sequences,
     stop_positions,
+    tokenizer=None,
+    eot_marker="<|eot_id|>",
     newline_token_id=None,
     newline_run_length=10,
 ):
@@ -149,6 +170,22 @@ def _update_stop_positions(
                 torch.minimum(updated_stop_positions, first_stop_positions),
                 updated_stop_positions,
             )
+
+    # Detect `<|eot_id|>` from decoded text to avoid tokenizer-dependent tokenization misses.
+    if tokenizer is not None and eot_marker:
+        unresolved_rows = torch.nonzero(updated_stop_positions >= x.shape[1], as_tuple=False).squeeze(1).tolist()
+        for row_idx in unresolved_rows:
+            row_token_ids = [int(token_id) for token_id in generated_tokens[row_idx].tolist()]
+            eot_token_offset = _find_first_prefix_with_substring(
+                tokenizer=tokenizer,
+                token_ids=row_token_ids,
+                substring=eot_marker,
+            )
+            if eot_token_offset is not None:
+                updated_stop_positions[row_idx] = min(
+                    int(updated_stop_positions[row_idx].item()),
+                    prompt_length + eot_token_offset,
+                )
 
     has_newline_run, first_newline_offsets = _find_repeated_token_run_start(
         generated_tokens,
@@ -381,6 +418,8 @@ def generate(
                         prompt_length=prompt_length,
                         stop_token_sequences=stop_token_sequences_tensor,
                         stop_positions=stop_positions,
+                        tokenizer=tokenizer,
+                        eot_marker="<|eot_id|>",
                         newline_token_id=newline_token_id,
                         newline_run_length=newline_run_length,
                     )
