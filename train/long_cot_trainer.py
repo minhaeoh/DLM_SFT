@@ -149,6 +149,9 @@ class DiffuSelfDistillDataCollator:
         if self.pad_token_id is None:
             raise ValueError("Tokenizer must provide pad_token_id or eos_token_id.")
         self.fallback_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else self.pad_token_id
+        self.response_terminal_token_id = (
+            tokenizer.eos_token_id if tokenizer.eos_token_id is not None else self.fallback_token_id
+        )
 
     def _validate_t_sampling_settings(self):
         if self.t_min > self.t_max:
@@ -718,10 +721,18 @@ class DiffuSelfDistillTrainer(Trainer):
         response_budget = self.data_collator.max_length - int(student_prompt_ids.numel())
         response_budget = max(response_budget, 1)
 
-        if response_ids.numel() == 0:
-            response_ids = response_ids.new_tensor([self.data_collator.fallback_token_id], dtype=torch.long)
+        terminal_token_id = self.data_collator.response_terminal_token_id
 
-        response_ids = response_ids[:response_budget]
+        if response_ids.numel() > 0:
+            while response_ids.numel() > 0 and int(response_ids[-1].item()) == terminal_token_id:
+                response_ids = response_ids[:-1]
+
+        content_budget = max(response_budget - 1, 0)
+        response_ids = response_ids[:content_budget]
+        response_ids = torch.cat(
+            [response_ids, response_ids.new_tensor([terminal_token_id], dtype=torch.long)],
+            dim=0,
+        )
         return student_prompt_ids, response_ids
 
     def _build_kd_mask(
