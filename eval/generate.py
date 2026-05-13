@@ -168,7 +168,8 @@ def _update_stop_positions(
 
 def _mask_stopped_tokens(x, stop_positions, mask_id):
     sequence_positions = torch.arange(x.shape[1], device=x.device)
-    stopped_positions = sequence_positions.unsqueeze(0) >= stop_positions.unsqueeze(1)
+    # Keep the first stop token itself (e.g., EOS) and mask only tokens after it.
+    stopped_positions = sequence_positions.unsqueeze(0) > stop_positions.unsqueeze(1)
     return x.masked_fill(stopped_positions, mask_id)
 
 

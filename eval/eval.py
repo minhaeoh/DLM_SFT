@@ -226,6 +226,30 @@ def decode_generated_texts(
     return decoded_texts
 
 
+def decode_raw_generated_texts(
+    tokenizer,
+    generated_token_ids: torch.Tensor,
+    mask_id: int,
+    truncate_at_mask: bool = False,
+) -> list[str]:
+    decoded_texts = []
+    for token_ids in generated_token_ids.tolist():
+        cutoff = len(token_ids)
+        if truncate_at_mask:
+            try:
+                cutoff = min(cutoff, token_ids.index(mask_id))
+            except ValueError:
+                pass
+        decoded_texts.append(
+            tokenizer.decode(
+                token_ids[:cutoff],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        )
+    return decoded_texts
+
+
 def _extract_number(text, use_last_match=False):
     try:
         return float(text)
@@ -538,9 +562,16 @@ def evaluate(
             earlystop=earlystop,
         )
 
+        generation_token_ids = out[:, -effective_gen_length:]
         generated_texts = decode_generated_texts(
             tokenizer,
-            out[:, -effective_gen_length:],
+            generation_token_ids,
+            mask_id=mask_id,
+            truncate_at_mask=earlystop,
+        )
+        raw_generated_texts = decode_raw_generated_texts(
+            tokenizer,
+            generation_token_ids,
             mask_id=mask_id,
             truncate_at_mask=earlystop,
         )
@@ -549,6 +580,7 @@ def evaluate(
                 "question": questions[j],
                 "prompt_input": prompts[j],
                 "generations": generated_texts[j],
+                "raw_generation": raw_generated_texts[j],
                 "ground_truth": gt_answers[j],
             }
             for j in range(len(gt_answers))
@@ -791,11 +823,19 @@ if __name__ == "__main__":
             "processed": metrics.get("processed"),
             "accuracy": metrics.get("accuracy"),
         }
+        saved_generations = []
+        for example in metrics["generations"]:
+            saved_example = dict(example)
+            raw_generation = saved_example.pop("raw_generation", None)
+            if raw_generation is not None:
+                saved_example["truncated_generation"] = saved_example.get("generations", "")
+                saved_example["generations"] = raw_generation
+            saved_generations.append(saved_example)
 
         with open(filename, "w") as f:
             json.dump(
                 {
-                    "generations": metrics["generations"],
+                    "generations": saved_generations,
                     "metrics": saved_metrics,
                     "model_path": args.model_path,
                     "checkpoint_path": args.checkpoint_path,
