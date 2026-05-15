@@ -493,6 +493,64 @@ def format_generation_for_log(generation: str, max_blank_lines: int = 6) -> str:
     return pattern.sub(_summarize_blank_lines, text)
 
 
+def summarize_annotated_generations(generations):
+    processed = len(generations)
+    correct = sum(1 for item in generations if item.get("correct") is True)
+    accuracy = correct / processed * 100 if processed > 0 else 0.0
+    return {"correct": correct, "processed": processed, "accuracy": accuracy}
+
+
+def build_saved_output(
+    metrics,
+    model_path,
+    checkpoint_path,
+    gen_length,
+    diffusion_steps,
+    block_length,
+    prompt_style,
+    newline_later,
+    earlystop,
+):
+    saved_metrics = {
+        "wall_time": metrics["wall_time"],
+        "total_processed": metrics.get("processed", metrics["total_processed"]),
+        "correct": metrics.get("correct"),
+        "processed": metrics.get("processed"),
+        "accuracy": metrics.get("accuracy"),
+    }
+    saved_generations = []
+    for example in metrics["generations"]:
+        saved_example = dict(example)
+        raw_generation = saved_example.pop("raw_generation", None)
+        if raw_generation is not None:
+            saved_example["truncated_generation"] = saved_example.get("generations", "")
+            saved_example["generations"] = raw_generation
+        saved_generations.append(saved_example)
+
+    return {
+        "generations": saved_generations,
+        "metrics": saved_metrics,
+        "model_path": model_path,
+        "checkpoint_path": checkpoint_path,
+        "gen_length": gen_length,
+        "diffusion_steps": diffusion_steps,
+        "block_length": block_length,
+        "prompt_style": prompt_style,
+        "newline_later": newline_later,
+        "earlystop": earlystop,
+    }
+
+
+def save_output_atomic(filename, payload):
+    output_path = Path(filename)
+    tmp_path = output_path.with_name(f".{output_path.name}.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, output_path)
+
+
 def evaluate(
     model,
     tokenizer,
@@ -508,6 +566,7 @@ def evaluate(
     prompt_style="default",
     newline_later=False,
     earlystop=False,
+    save_callback=None,
 ):
     model.eval()
     device = next(model.parameters()).device
@@ -594,6 +653,15 @@ def evaluate(
         all_generations.extend(example_result)
         total_processed += len(generated_texts)
         wall_times.append(time.time() - start_time)
+
+        if save_callback is not None:
+            interim_metrics = {
+                "wall_time": sum(wall_times) / len(wall_times) if wall_times else 0.0,
+                "generations": all_generations,
+                "total_processed": total_processed.item(),
+            }
+            interim_metrics.update(summarize_annotated_generations(all_generations))
+            save_callback(interim_metrics)
 
         # Print individual results
         if get_rank() == 0:
@@ -777,77 +845,76 @@ if __name__ == "__main__":
     filename = f"{args.output_dir}/{args.dataset}_{model_name}_{args.gen_length}_{args.diffusion_steps}_{get_rank()}_generations.json"
     print(f"Saving generations to {filename}")
 
-    metrics = evaluate(
-        model,
-        tokenizer,
-        dataloader,
-        dataset_name=args.dataset,
-        gen_length=args.gen_length,
-        block_length=args.block_length,
-        steps=args.diffusion_steps,
-        mask_id=resolved_mask_id,
-        max_context_length=args.max_context_length,
-        prompt_style=args.prompt_style,
-        newline_later=args.newline_later,
-        earlystop=args.earlystop,
-    )
-
-    if args.dataset == "gsm8k":
-        gsm8k_metrics = compute_gsm8k_accuracy(
-            metrics["generations"],
-            prompt_style=args.prompt_style,
-            truncate_repeated_newlines=args.earlystop,
-        )
-        metrics.update(gsm8k_metrics)
-        print(
-            f"GSM8K accuracy: {gsm8k_metrics['correct']}/{gsm8k_metrics['processed']} "
-            f"({gsm8k_metrics['accuracy']:.2f}%)"
-        )
-    elif args.dataset == "math":
-        math_metrics = compute_math_accuracy(
-            metrics["generations"],
-            prompt_style=args.prompt_style,
-            truncate_repeated_newlines=args.earlystop,
-        )
-        metrics.update(math_metrics)
-        print(
-            f"{args.dataset.upper()} accuracy: {math_metrics['correct']}/{math_metrics['processed']} "
-            f"({math_metrics['accuracy']:.2f}%)"
-        )
-
+    save_callback = None
     if not args.dont_save:
-        saved_metrics = {
-            "wall_time": metrics["wall_time"],
-            "total_processed": metrics.get("processed", metrics["total_processed"]),
-            "correct": metrics.get("correct"),
-            "processed": metrics.get("processed"),
-            "accuracy": metrics.get("accuracy"),
-        }
-        saved_generations = []
-        for example in metrics["generations"]:
-            saved_example = dict(example)
-            raw_generation = saved_example.pop("raw_generation", None)
-            if raw_generation is not None:
-                saved_example["truncated_generation"] = saved_example.get("generations", "")
-                saved_example["generations"] = raw_generation
-            saved_generations.append(saved_example)
-
-        with open(filename, "w") as f:
-            json.dump(
-                {
-                    "generations": saved_generations,
-                    "metrics": saved_metrics,
-                    "model_path": args.model_path,
-                    "checkpoint_path": args.checkpoint_path,
-                    "gen_length": args.gen_length,
-                    "diffusion_steps": args.diffusion_steps,
-                    "block_length": args.block_length,
-                    "prompt_style": args.prompt_style,
-                    "newline_later": args.newline_later,
-                    "earlystop": args.earlystop,
-                },
-                f,
-                indent=2,
+        def save_callback(current_metrics):
+            save_output_atomic(
+                filename,
+                build_saved_output(
+                    current_metrics,
+                    model_path=args.model_path,
+                    checkpoint_path=args.checkpoint_path,
+                    gen_length=args.gen_length,
+                    diffusion_steps=args.diffusion_steps,
+                    block_length=args.block_length,
+                    prompt_style=args.prompt_style,
+                    newline_later=args.newline_later,
+                    earlystop=args.earlystop,
+                ),
             )
 
-    cleanup_ddp()
+        save_callback(
+            {
+                "wall_time": 0.0,
+                "generations": [],
+                "total_processed": 0,
+                "correct": 0,
+                "processed": 0,
+                "accuracy": 0.0,
+            }
+        )
+
+    try:
+        metrics = evaluate(
+            model,
+            tokenizer,
+            dataloader,
+            dataset_name=args.dataset,
+            gen_length=args.gen_length,
+            block_length=args.block_length,
+            steps=args.diffusion_steps,
+            mask_id=resolved_mask_id,
+            max_context_length=args.max_context_length,
+            prompt_style=args.prompt_style,
+            newline_later=args.newline_later,
+            earlystop=args.earlystop,
+            save_callback=save_callback,
+        )
+
+        if args.dataset == "gsm8k":
+            gsm8k_metrics = compute_gsm8k_accuracy(
+                metrics["generations"],
+                prompt_style=args.prompt_style,
+                truncate_repeated_newlines=args.earlystop,
+            )
+            metrics.update(gsm8k_metrics)
+            print(
+                f"GSM8K accuracy: {gsm8k_metrics['correct']}/{gsm8k_metrics['processed']} "
+                f"({gsm8k_metrics['accuracy']:.2f}%)"
+            )
+        elif args.dataset == "math":
+            math_metrics = compute_math_accuracy(
+                metrics["generations"],
+                prompt_style=args.prompt_style,
+                truncate_repeated_newlines=args.earlystop,
+            )
+            metrics.update(math_metrics)
+            print(
+                f"{args.dataset.upper()} accuracy: {math_metrics['correct']}/{math_metrics['processed']} "
+                f"({math_metrics['accuracy']:.2f}%)"
+            )
+
+        if save_callback is not None:
+            save_callback(metrics)
+    finally:
+        cleanup_ddp()
