@@ -128,13 +128,20 @@ class GSM8KDataset(torch.utils.data.Dataset):
         questions = [item[1] for item in batch]
         answers = [item[2] for item in batch]
         dataset_indices = [item[3] for item in batch]
-        input_ids = self.tokenizer(
-            prompts, padding_side="left", return_tensors="pt", padding="longest"
-        ).input_ids
+        tokenized = self.tokenizer(
+            prompts,
+            padding_side="left",
+            return_tensors="pt",
+            padding="longest",
+            return_attention_mask=True,
+        )
+        input_ids = tokenized.input_ids
+        prompt_token_lengths = [int(length) for length in tokenized.attention_mask.sum(dim=1).tolist()]
         return {
             "input_ids": input_ids,
             "questions": questions,
             "answers": answers,
             "prompts": prompts,
             "dataset_indices": dataset_indices,
+            "prompt_token_lengths": prompt_token_lengths,
         }

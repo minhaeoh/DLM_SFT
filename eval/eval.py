@@ -1,5 +1,6 @@
 import argparse
 import functools
+import gc
 import importlib
 import json
 import math
@@ -530,6 +531,8 @@ def build_saved_output(
         "correct": metrics.get("correct"),
         "processed": metrics.get("processed"),
         "accuracy": metrics.get("accuracy"),
+        "num_skipped": metrics.get("num_skipped", len(metrics.get("skipped_examples", []))),
+        "oom_fallback_batches": metrics.get("oom_fallback_batches", 0),
     }
     saved_generations = []
     for example in metrics["generations"]:
@@ -539,6 +542,10 @@ def build_saved_output(
             saved_example["truncated_generation"] = saved_example.get("generations", "")
             saved_example["generations"] = raw_generation
         saved_generations.append(saved_example)
+
+    skipped_examples = [dict(example) for example in metrics.get("skipped_examples", [])]
+    num_skipped = metrics.get("num_skipped", len(skipped_examples))
+    oom_fallback_batches = metrics.get("oom_fallback_batches", 0)
 
     return {
         "generations": saved_generations,
@@ -556,6 +563,9 @@ def build_saved_output(
         "resolved_start_index": resolved_start_index,
         "resolved_end_index": resolved_end_index,
         "index_range_label": index_range_label,
+        "num_skipped": num_skipped,
+        "oom_fallback_batches": oom_fallback_batches,
+        "skipped_examples": skipped_examples,
     }
 
 
@@ -567,6 +577,138 @@ def save_output_atomic(filename, payload):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, output_path)
+
+
+def is_cuda_oom_error(exception: RuntimeError) -> bool:
+    message = str(exception).lower()
+    oom_markers = ("out of memory", "cublas_status_alloc_failed")
+    return any(marker in message for marker in oom_markers)
+
+
+def cleanup_cuda_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipcmem_collect"):
+            torch.cuda.ipcmem_collect()
+
+
+def slice_batch_rows(batch, row_indices):
+    row_indices = [int(idx) for idx in row_indices]
+    sliced_batch = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            sliced_batch[key] = value[row_indices]
+        elif isinstance(value, list):
+            sliced_batch[key] = [value[idx] for idx in row_indices]
+        else:
+            sliced_batch[key] = value
+    return sliced_batch
+
+
+def resolve_effective_gen_length(input_ids, requested_gen_length, max_context_length, block_length):
+    effective_gen_length = requested_gen_length
+    if max_context_length is not None and max_context_length > 0:
+        remaining_context = max_context_length - input_ids.shape[1]
+        if remaining_context < requested_gen_length:
+            effective_gen_length = max(0, (remaining_context // block_length) * block_length)
+    return effective_gen_length
+
+
+def run_generation_step(
+    model,
+    tokenizer,
+    input_ids,
+    effective_gen_length,
+    temperature,
+    cfg_scale,
+    steps,
+    block_length,
+    mask_id,
+    newline_later,
+    earlystop,
+):
+    out = generate(
+        model,
+        input_ids,
+        tokenizer,
+        steps=steps,
+        gen_length=effective_gen_length,
+        block_length=block_length,
+        temperature=temperature,
+        cfg_scale=cfg_scale,
+        remasking="low_confidence",
+        mask_id=mask_id,
+        newline_later=newline_later,
+        earlystop=earlystop,
+    )
+
+    generation_token_ids = out[:, -effective_gen_length:]
+    generated_texts = decode_generated_texts(
+        tokenizer,
+        generation_token_ids,
+        mask_id=mask_id,
+        truncate_at_mask=earlystop,
+    )
+    raw_generated_texts = decode_raw_generated_texts(
+        tokenizer,
+        generation_token_ids,
+        mask_id=mask_id,
+        truncate_at_mask=earlystop,
+    )
+    return generated_texts, raw_generated_texts
+
+
+def build_example_results(batch, generated_texts, raw_generated_texts):
+    gt_answers = batch["answers"]
+    questions = batch["questions"]
+    prompts = batch["prompts"]
+    dataset_indices = batch.get("dataset_indices")
+    prompt_token_lengths = batch.get("prompt_token_lengths")
+
+    example_result = []
+    for j in range(len(gt_answers)):
+        item = {
+            "question": questions[j],
+            "prompt_input": prompts[j],
+            "generations": generated_texts[j],
+            "raw_generation": raw_generated_texts[j],
+            "ground_truth": gt_answers[j],
+        }
+        if prompt_token_lengths is not None:
+            item["prompt_token_length"] = int(prompt_token_lengths[j])
+        if dataset_indices is not None:
+            item["dataset_index"] = int(dataset_indices[j])
+        example_result.append(item)
+    return example_result
+
+
+def build_skipped_example(batch, row_idx, reason, requested_gen_length, effective_gen_length):
+    skipped_example = {
+        "reason": reason,
+        "requested_gen_length": requested_gen_length,
+        "effective_gen_length": effective_gen_length,
+    }
+    dataset_indices = batch.get("dataset_indices")
+    prompt_token_lengths = batch.get("prompt_token_lengths")
+    if dataset_indices is not None:
+        skipped_example["dataset_index"] = int(dataset_indices[row_idx])
+    if prompt_token_lengths is not None:
+        skipped_example["prompt_token_length"] = int(prompt_token_lengths[row_idx])
+    return skipped_example
+
+
+def build_interim_metrics(wall_times, all_generations, total_processed, skipped_examples, oom_fallback_batches):
+    interim_metrics = {
+        "wall_time": sum(wall_times) / len(wall_times) if wall_times else 0.0,
+        "generations": all_generations,
+        "total_processed": total_processed.item(),
+        "skipped_examples": skipped_examples,
+        "num_skipped": len(skipped_examples),
+        "oom_fallback_batches": oom_fallback_batches,
+    }
+    interim_metrics.update(summarize_annotated_generations(all_generations))
+    return interim_metrics
 
 
 def evaluate(
@@ -591,118 +733,203 @@ def evaluate(
     total_processed = torch.tensor(0, device=device)
     wall_times = []
     all_generations = []
+    skipped_examples = []
+    oom_fallback_batches = 0
     warned_context_overflow = False
-    warned_context_skip = False
 
     for batch in tqdm(dataloader, disable=(get_rank() != 0)):
         start_time = time.time()
-        input_ids = batch["input_ids"].to(device)
+        batch["input_ids"] = batch["input_ids"].to(device)
+        input_ids = batch["input_ids"]
         gt_answers = batch["answers"]
-        questions = batch["questions"]
-        prompts = batch["prompts"]
         dataset_indices = batch.get("dataset_indices")
-        effective_gen_length = gen_length
+        prompt_token_lengths = batch.get("prompt_token_lengths")
+        batch_results = []
 
-        if max_context_length is not None and max_context_length > 0:
-            remaining_context = max_context_length - input_ids.shape[1]
-            if remaining_context < gen_length:
-                effective_gen_length = max(0, (remaining_context // block_length) * block_length)
+        effective_gen_length = resolve_effective_gen_length(
+            input_ids,
+            requested_gen_length=gen_length,
+            max_context_length=max_context_length,
+            block_length=block_length,
+        )
 
-                if get_rank() == 0 and not warned_context_overflow:
-                    print(
-                        f"[warn] prompt_length({input_ids.shape[1]}) + gen_length({gen_length}) exceeds "
-                        f"max_context_length({max_context_length}). "
-                        f"Using reduced gen_length({effective_gen_length}) for this batch."
-                    )
-                    warned_context_overflow = True
+        if max_context_length is not None and max_context_length > 0 and effective_gen_length < gen_length:
+            if get_rank() == 0 and not warned_context_overflow:
+                print(
+                    f"[warn] prompt_length({input_ids.shape[1]}) + gen_length({gen_length}) exceeds "
+                    f"max_context_length({max_context_length}). "
+                    f"Using reduced gen_length({effective_gen_length}) for this batch."
+                )
+                warned_context_overflow = True
 
         if effective_gen_length <= 0:
-            if get_rank() == 0 and not warned_context_skip:
+            if get_rank() == 0:
                 print(
-                    f"[warn] prompt_length({input_ids.shape[1]}) leaves no room for generation within "
-                    f"max_context_length({max_context_length}). Skipping this batch."
+                    f"[warn] Skipping batch because prompt lengths leave no room within "
+                    f"max_context_length({max_context_length}). "
+                    f"dataset_indices={dataset_indices if dataset_indices is not None else '<none>'} "
+                    f"prompt_token_lengths={prompt_token_lengths if prompt_token_lengths is not None else '<unknown>'}"
                 )
-                warned_context_skip = True
+            for row_idx in range(len(gt_answers)):
+                skipped_examples.append(
+                    build_skipped_example(
+                        batch,
+                        row_idx=row_idx,
+                        reason="max_context_length_exceeded",
+                        requested_gen_length=gen_length,
+                        effective_gen_length=effective_gen_length,
+                    )
+                )
+            if save_callback is not None:
+                save_callback(
+                    build_interim_metrics(
+                        wall_times,
+                        all_generations,
+                        total_processed,
+                        skipped_examples,
+                        oom_fallback_batches,
+                    )
+                )
             continue
 
-        out = generate(
-            model,
-            input_ids,
-            tokenizer,
-            steps=steps,
-            gen_length=effective_gen_length,
-            block_length=block_length,
-            temperature=temperature,
-            cfg_scale=cfg_scale,
-            remasking="low_confidence",
-            mask_id=mask_id,
-            newline_later=newline_later,
-            earlystop=earlystop,
-        )
+        try:
+            generated_texts, raw_generated_texts = run_generation_step(
+                model,
+                tokenizer,
+                input_ids,
+                effective_gen_length=effective_gen_length,
+                temperature=temperature,
+                cfg_scale=cfg_scale,
+                steps=steps,
+                block_length=block_length,
+                mask_id=mask_id,
+                newline_later=newline_later,
+                earlystop=earlystop,
+            )
+            batch_results = build_example_results(batch, generated_texts, raw_generated_texts)
+        except RuntimeError as exception:
+            if not is_cuda_oom_error(exception):
+                raise
 
-        generation_token_ids = out[:, -effective_gen_length:]
-        generated_texts = decode_generated_texts(
-            tokenizer,
-            generation_token_ids,
-            mask_id=mask_id,
-            truncate_at_mask=earlystop,
-        )
-        raw_generated_texts = decode_raw_generated_texts(
-            tokenizer,
-            generation_token_ids,
-            mask_id=mask_id,
-            truncate_at_mask=earlystop,
-        )
-        example_result = []
-        for j in range(len(gt_answers)):
-            item = {
-                "question": questions[j],
-                "prompt_input": prompts[j],
-                "generations": generated_texts[j],
-                "raw_generation": raw_generated_texts[j],
-                "ground_truth": gt_answers[j],
-            }
-            if dataset_indices is not None:
-                item["dataset_index"] = int(dataset_indices[j])
-            example_result.append(item)
-        annotate_generation_results(
-            dataset_name,
-            example_result,
-            prompt_style=prompt_style,
-            truncate_repeated_newlines=earlystop,
-        )
-        all_generations.extend(example_result)
-        total_processed += len(generated_texts)
+            cleanup_cuda_memory()
+            oom_fallback_batches += 1
+            if get_rank() == 0:
+                print(
+                    f"[warn] CUDA OOM during batch eval. Retrying one sample at a time. "
+                    f"batch_size={len(gt_answers)} "
+                    f"dataset_indices={dataset_indices if dataset_indices is not None else '<none>'} "
+                    f"prompt_token_lengths={prompt_token_lengths if prompt_token_lengths is not None else '<unknown>'}"
+                )
+
+            for row_idx in range(len(gt_answers)):
+                single_batch = slice_batch_rows(batch, [row_idx])
+                single_batch["input_ids"] = single_batch["input_ids"].to(device)
+                single_effective_gen_length = resolve_effective_gen_length(
+                    single_batch["input_ids"],
+                    requested_gen_length=gen_length,
+                    max_context_length=max_context_length,
+                    block_length=block_length,
+                )
+
+                if single_effective_gen_length <= 0:
+                    skipped_example = build_skipped_example(
+                        single_batch,
+                        row_idx=0,
+                        reason="max_context_length_exceeded",
+                        requested_gen_length=gen_length,
+                        effective_gen_length=single_effective_gen_length,
+                    )
+                    skipped_examples.append(skipped_example)
+                    if get_rank() == 0:
+                        print(
+                            f"[warn] Skipping sample after single-item retry because prompt leaves no room: "
+                            f"dataset_index={skipped_example.get('dataset_index', '<none>')} "
+                            f"prompt_token_length={skipped_example.get('prompt_token_length', '<unknown>')}"
+                        )
+                    continue
+
+                try:
+                    generated_texts, raw_generated_texts = run_generation_step(
+                        model,
+                        tokenizer,
+                        single_batch["input_ids"],
+                        effective_gen_length=single_effective_gen_length,
+                        temperature=temperature,
+                        cfg_scale=cfg_scale,
+                        steps=steps,
+                        block_length=block_length,
+                        mask_id=mask_id,
+                        newline_later=newline_later,
+                        earlystop=earlystop,
+                    )
+                    batch_results.extend(build_example_results(single_batch, generated_texts, raw_generated_texts))
+                except RuntimeError as single_exception:
+                    if not is_cuda_oom_error(single_exception):
+                        raise
+                    cleanup_cuda_memory()
+                    skipped_example = build_skipped_example(
+                        single_batch,
+                        row_idx=0,
+                        reason="cuda_oom_after_single_retry",
+                        requested_gen_length=gen_length,
+                        effective_gen_length=single_effective_gen_length,
+                    )
+                    skipped_examples.append(skipped_example)
+                    if get_rank() == 0:
+                        print(
+                            f"[warn] Skipping sample after single-item CUDA OOM retry: "
+                            f"dataset_index={skipped_example.get('dataset_index', '<none>')} "
+                            f"prompt_token_length={skipped_example.get('prompt_token_length', '<unknown>')}"
+                        )
+
+        if batch_results:
+            annotate_generation_results(
+                dataset_name,
+                batch_results,
+                prompt_style=prompt_style,
+                truncate_repeated_newlines=earlystop,
+            )
+            all_generations.extend(batch_results)
+            total_processed += len(batch_results)
+
         wall_times.append(time.time() - start_time)
 
         if save_callback is not None:
-            interim_metrics = {
-                "wall_time": sum(wall_times) / len(wall_times) if wall_times else 0.0,
-                "generations": all_generations,
-                "total_processed": total_processed.item(),
-            }
-            interim_metrics.update(summarize_annotated_generations(all_generations))
-            save_callback(interim_metrics)
+            save_callback(
+                build_interim_metrics(
+                    wall_times,
+                    all_generations,
+                    total_processed,
+                    skipped_examples,
+                    oom_fallback_batches,
+                )
+            )
 
-        # Print individual results
-        if get_rank() == 0:
-            idx = random.randint(0, len(questions) - 1)
-            print(f"Question: {questions[idx]}")
+        if get_rank() == 0 and batch_results:
+            idx = random.randint(0, len(batch_results) - 1)
+            sample_result = batch_results[idx]
+            print(f"Question: {sample_result['question']}")
             print("-" * 50)
             print("Generation:")
-            sample_generation = generated_texts[idx]
-            print(format_generation_for_log(sample_generation))
+            print(format_generation_for_log(sample_result["generations"]))
             print("-" * 50)
-            print(f"Generated Answer: {get_logged_generated_answer(example_result[idx])}")
-            print(f"Ground truth: {gt_answers[idx]}")
-            if "correct" in example_result[idx]:
-                print(f"Correct: {example_result[idx]['correct']}")
+            if "dataset_index" in sample_result:
+                print(f"Dataset index: {sample_result['dataset_index']}")
+            if "prompt_token_length" in sample_result:
+                print(f"Prompt tokens: {sample_result['prompt_token_length']}")
+            print(f"Generated Answer: {get_logged_generated_answer(sample_result)}")
+            print(f"Ground truth: {sample_result['ground_truth']}")
+            if "correct" in sample_result:
+                print(f"Correct: {sample_result['correct']}")
 
     avg_wall_time = sum(wall_times) / len(wall_times) if wall_times else 0.0
     metrics = {
         "wall_time": avg_wall_time,
         "generations": all_generations,
         "total_processed": total_processed.item(),
+        "skipped_examples": skipped_examples,
+        "num_skipped": len(skipped_examples),
+        "oom_fallback_batches": oom_fallback_batches,
     }
     return metrics
 
