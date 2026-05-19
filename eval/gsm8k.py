@@ -66,18 +66,44 @@ class GSM8KDataset(torch.utils.data.Dataset):
         tokenizer,
         prompt_style="default",
         subsample=-1,
+        start_index=0,
+        end_index=-1,
     ):
         self.tokenizer = tokenizer
         self.prompt_style = _normalize_prompt_style(prompt_style)
         self.load_test_dataset()
 
+        total_examples = len(self.dataset)
+        if start_index < 0:
+            raise ValueError(f"start_index must be >= 0, got {start_index}.")
+        if start_index >= total_examples:
+            raise ValueError(
+                f"start_index {start_index} is out of range for dataset of size {total_examples}."
+            )
+        if end_index != -1 and end_index < start_index:
+            raise ValueError(
+                f"end_index must be >= start_index (got start_index={start_index}, end_index={end_index})."
+            )
+        if end_index >= total_examples:
+            raise ValueError(
+                f"end_index {end_index} is out of range for dataset of size {total_examples}."
+            )
+
+        self.start_index = int(start_index)
+        self.requested_end_index = int(end_index)
+        self.effective_end_index = total_examples - 1 if end_index == -1 else int(end_index)
+
+        candidate_indices = np.arange(self.start_index, self.effective_end_index + 1)
+        assert subsample <= len(candidate_indices), "Subsample size is greater than selected dataset range"
         self.subsample = (
-            np.random.choice(len(self.dataset), subsample, replace=False)
+            np.random.choice(candidate_indices, subsample, replace=False)
             if subsample != -1
-            else np.arange(len(self.dataset))
+            else candidate_indices
         )
-        print(f"evaluating {len(self.subsample)} examples")
-        assert subsample <= len(self.dataset), "Subsample size is greater than dataset size"
+        print(
+            f"evaluating {len(self.subsample)} examples "
+            f"(dataset indices: {self.start_index}-{self.effective_end_index})"
+        )
 
     def __len__(self):
         return len(self.subsample)
@@ -91,16 +117,24 @@ class GSM8KDataset(torch.utils.data.Dataset):
         return _render_chat_prompt(self.tokenizer, user_prompt)
 
     def __getitem__(self, idx):
-        question = self.dataset[self.subsample[idx].item()]["question"]
-        answer = Parser.extract_answer_gsm8k(self.dataset[self.subsample[idx].item()]["answer"])
+        dataset_index = int(self.subsample[idx])
+        question = self.dataset[dataset_index]["question"]
+        answer = Parser.extract_answer_gsm8k(self.dataset[dataset_index]["answer"])
         prompt = self.create_prompt(question)
-        return prompt, question, answer
+        return prompt, question, answer, dataset_index
 
     def collate_fn(self, batch):
         prompts = [item[0] for item in batch]
         questions = [item[1] for item in batch]
         answers = [item[2] for item in batch]
+        dataset_indices = [item[3] for item in batch]
         input_ids = self.tokenizer(
             prompts, padding_side="left", return_tensors="pt", padding="longest"
         ).input_ids
-        return {"input_ids": input_ids, "questions": questions, "answers": answers, "prompts": prompts}
+        return {
+            "input_ids": input_ids,
+            "questions": questions,
+            "answers": answers,
+            "prompts": prompts,
+            "dataset_indices": dataset_indices,
+        }

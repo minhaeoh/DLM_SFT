@@ -500,6 +500,14 @@ def summarize_annotated_generations(generations):
     return {"correct": correct, "processed": processed, "accuracy": accuracy}
 
 
+def build_requested_index_range_label(start_index: int, end_index: int) -> str:
+    if start_index == 0 and end_index == -1:
+        return ""
+    if end_index == -1:
+        return f"idx{start_index}-end"
+    return f"idx{start_index}-{end_index}"
+
+
 def build_saved_output(
     metrics,
     model_path,
@@ -510,6 +518,11 @@ def build_saved_output(
     prompt_style,
     newline_later,
     earlystop,
+    requested_start_index,
+    requested_end_index,
+    resolved_start_index,
+    resolved_end_index,
+    index_range_label,
 ):
     saved_metrics = {
         "wall_time": metrics["wall_time"],
@@ -538,6 +551,11 @@ def build_saved_output(
         "prompt_style": prompt_style,
         "newline_later": newline_later,
         "earlystop": earlystop,
+        "requested_start_index": requested_start_index,
+        "requested_end_index": requested_end_index,
+        "resolved_start_index": resolved_start_index,
+        "resolved_end_index": resolved_end_index,
+        "index_range_label": index_range_label,
     }
 
 
@@ -582,6 +600,7 @@ def evaluate(
         gt_answers = batch["answers"]
         questions = batch["questions"]
         prompts = batch["prompts"]
+        dataset_indices = batch.get("dataset_indices")
         effective_gen_length = gen_length
 
         if max_context_length is not None and max_context_length > 0:
@@ -634,16 +653,18 @@ def evaluate(
             mask_id=mask_id,
             truncate_at_mask=earlystop,
         )
-        example_result = [
-            {
+        example_result = []
+        for j in range(len(gt_answers)):
+            item = {
                 "question": questions[j],
                 "prompt_input": prompts[j],
                 "generations": generated_texts[j],
                 "raw_generation": raw_generated_texts[j],
                 "ground_truth": gt_answers[j],
             }
-            for j in range(len(gt_answers))
-        ]
+            if dataset_indices is not None:
+                item["dataset_index"] = int(dataset_indices[j])
+            example_result.append(item)
         annotate_generation_results(
             dataset_name,
             example_result,
@@ -787,6 +808,18 @@ if __name__ == "__main__":
         default=-1,
         help="If > 0, evaluate only this many samples (useful for smoke tests).",
     )
+    parser.add_argument(
+        "--start_index",
+        type=int,
+        default=0,
+        help="0-based inclusive start index for a contiguous eval slice.",
+    )
+    parser.add_argument(
+        "--end_index",
+        type=int,
+        default=-1,
+        help="0-based inclusive end index for a contiguous eval slice. Use -1 to run through the end.",
+    )
     args = parser.parse_args()
 
     # args.diffusion_steps = args.gen_length // 2
@@ -825,7 +858,15 @@ if __name__ == "__main__":
         tokenizer,
         subsample=dataset_subsample,
         prompt_style=args.prompt_style,
+        start_index=args.start_index,
+        end_index=args.end_index,
     )
+    requested_range_label = build_requested_index_range_label(args.start_index, args.end_index)
+    resolved_range_label = f"idx{dataset.start_index}-{dataset.effective_end_index}"
+
+    if get_rank() == 0:
+        print(f"Requested range : {requested_range_label or 'full'}")
+        print(f"Resolved range  : {resolved_range_label}")
 
     sampler = CustomDistributedSampler(dataset, shuffle=False) if get_world_size() > 1 else None
 
@@ -842,7 +883,12 @@ if __name__ == "__main__":
         model_name = model_name + f"_{args.suffix}"
 
     os.makedirs(args.output_dir, exist_ok=True)
-    filename = f"{args.output_dir}/{args.dataset}_{model_name}_{args.gen_length}_{args.diffusion_steps}_{get_rank()}_generations.json"
+    filename_stem = f"{args.dataset}_{model_name}"
+    if requested_range_label:
+        filename_stem = f"{filename_stem}_{requested_range_label}"
+    filename = (
+        f"{args.output_dir}/{filename_stem}_{args.gen_length}_{args.diffusion_steps}_{get_rank()}_generations.json"
+    )
     print(f"Saving generations to {filename}")
 
     save_callback = None
@@ -860,6 +906,11 @@ if __name__ == "__main__":
                     prompt_style=args.prompt_style,
                     newline_later=args.newline_later,
                     earlystop=args.earlystop,
+                    requested_start_index=args.start_index,
+                    requested_end_index=args.end_index,
+                    resolved_start_index=dataset.start_index,
+                    resolved_end_index=dataset.effective_end_index,
+                    index_range_label=requested_range_label or resolved_range_label,
                 ),
             )
 
