@@ -346,29 +346,38 @@ def extract_math_answer(
     )
     parsed_answer = None
 
-    try:
-        boxed_string = (
-            first_boxed_only_string(truncated_generation)
-            if prompt_style == "answer_first"
-            else last_boxed_only_string(truncated_generation)
-        )
-        parsed_answer = remove_boxed(boxed_string)
-    except Exception:
-        parsed_answer = None
+    # Only attempt boxed extraction when \boxed/\fbox is actually present;
+    # last_boxed_only_string returns the full input string when no \boxed is
+    # found, which causes remove_boxed to return the full text unchanged —
+    # a truthy value that prevents the <answer> tag fallback from ever firing.
+    if "\\boxed" in truncated_generation or "\\fbox" in truncated_generation:
+        try:
+            boxed_string = (
+                first_boxed_only_string(truncated_generation)
+                if prompt_style == "answer_first"
+                else last_boxed_only_string(truncated_generation)
+            )
+            parsed_answer = remove_boxed(boxed_string)
+        except Exception:
+            parsed_answer = None
 
     if not parsed_answer:
         answer_match = re.search(r"<answer>(.*?)</answer>", truncated_generation, re.DOTALL)
         if answer_match:
             answer_text = answer_match.group(1).strip()
-            try:
-                boxed_string = (
-                    first_boxed_only_string(answer_text)
-                    if prompt_style == "answer_first"
-                    else last_boxed_only_string(answer_text)
-                )
-                parsed_answer = remove_boxed(boxed_string)
-            except Exception:
-                parsed_answer = "<unparsed>"
+            # Try \boxed inside the tag first
+            if "\\boxed" in answer_text or "\\fbox" in answer_text:
+                try:
+                    boxed_string = (
+                        first_boxed_only_string(answer_text)
+                        if prompt_style == "answer_first"
+                        else last_boxed_only_string(answer_text)
+                    )
+                    parsed_answer = remove_boxed(boxed_string)
+                except Exception:
+                    parsed_answer = None
+            if not parsed_answer:
+                parsed_answer = answer_text if answer_text else None
 
     return parsed_answer
 
