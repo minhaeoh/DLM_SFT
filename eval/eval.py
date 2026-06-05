@@ -26,6 +26,7 @@ from generate import generate
 from gsm8k import GSM8KDataset
 from math500 import MATH500Dataset
 from parser_helper import is_equiv, last_boxed_only_string, first_boxed_only_string, remove_boxed
+from math_scorer import MATHScorer as _math_scorer
 
 
 def ensure_dynamic_rope_compat():
@@ -282,6 +283,31 @@ def _truncate_generation_at_stop(
     return text
 
 
+_UNICODE_MATH_MAP = str.maketrans({"π": r"\pi", "∞": r"\infty", "°": r"^\circ"})
+
+
+def _preprocess_math_answer(s: str | None) -> str | None:
+    if s is None:
+        return None
+    s = s.translate(_UNICODE_MATH_MAP)
+    s = re.sub(r"\\math[a-z]+\s*", "", s)
+    s = re.sub(r"\\boldsymbol\s*", "", s)
+    return s
+
+
+def _strip_math_dollars(text: str) -> str:
+    t = text.strip()
+    if t.startswith("$$") and t.endswith("$$"):
+        return t[2:-2].strip()
+    if t.startswith("$") and t.endswith("$") and len(t) > 2:
+        return t[1:-1].strip()
+    return t
+
+
+def _is_answer_placeholder(text: str) -> bool:
+    return bool(re.match(r"^[.\s]+$", text.strip()))
+
+
 def extract_gsm8k_answer(
     raw_generation,
     prompt_style: str = "default",
@@ -335,21 +361,50 @@ def compute_gsm8k_accuracy(
     return {"correct": correct, "processed": processed, "accuracy": accuracy}
 
 
+def extract_math_answer_strict(
+    raw_generation,
+    truncate_repeated_newlines: bool = False,
+):
+    """Parse only from within the <answer>...</answer> region. Returns None if region is absent or empty."""
+    truncated_generation = _truncate_generation_at_stop(
+        raw_generation,
+        truncate_repeated_newlines=truncate_repeated_newlines,
+    )
+
+    answer_match = re.search(r"<answer>(.*?)</answer>", truncated_generation, re.DOTALL)
+    if answer_match:
+        inner = answer_match.group(1).strip()
+        if inner and not _is_answer_placeholder(inner):
+            if "\\boxed" in inner or "\\fbox" in inner:
+                try:
+                    parsed = remove_boxed(first_boxed_only_string(inner))
+                    if parsed:
+                        return parsed
+                except Exception:
+                    pass
+            cleaned = _strip_math_dollars(inner)
+            if cleaned and not _is_answer_placeholder(cleaned):
+                return cleaned
+
+    return None
+
+
 def extract_math_answer(
     raw_generation,
     prompt_style: str = "default",
     truncate_repeated_newlines: bool = False,
 ):
+    """Parse answer: <answer> region first, then fallback to \\boxed anywhere in text."""
+    # 1) Strict: <answer> region only.
+    strict = extract_math_answer_strict(raw_generation, truncate_repeated_newlines=truncate_repeated_newlines)
+    if strict is not None:
+        return strict
+
+    # 2) Fallback: \boxed anywhere in the text (handles missing/malformed answer tags).
     truncated_generation = _truncate_generation_at_stop(
         raw_generation,
         truncate_repeated_newlines=truncate_repeated_newlines,
     )
-    parsed_answer = None
-
-    # Only attempt boxed extraction when \boxed/\fbox is actually present;
-    # last_boxed_only_string returns the full input string when no \boxed is
-    # found, which causes remove_boxed to return the full text unchanged —
-    # a truthy value that prevents the <answer> tag fallback from ever firing.
     if "\\boxed" in truncated_generation or "\\fbox" in truncated_generation:
         try:
             boxed_string = (
@@ -357,29 +412,13 @@ def extract_math_answer(
                 if prompt_style == "answer_first"
                 else last_boxed_only_string(truncated_generation)
             )
-            parsed_answer = remove_boxed(boxed_string)
+            parsed = remove_boxed(boxed_string)
+            if parsed:
+                return parsed
         except Exception:
-            parsed_answer = None
+            pass
 
-    if not parsed_answer:
-        answer_match = re.search(r"<answer>(.*?)</answer>", truncated_generation, re.DOTALL)
-        if answer_match:
-            answer_text = answer_match.group(1).strip()
-            # Try \boxed inside the tag first
-            if "\\boxed" in answer_text or "\\fbox" in answer_text:
-                try:
-                    boxed_string = (
-                        first_boxed_only_string(answer_text)
-                        if prompt_style == "answer_first"
-                        else last_boxed_only_string(answer_text)
-                    )
-                    parsed_answer = remove_boxed(boxed_string)
-                except Exception:
-                    parsed_answer = None
-            if not parsed_answer:
-                parsed_answer = answer_text if answer_text else None
-
-    return parsed_answer
+    return None
 
 
 def compute_math_accuracy(
@@ -388,22 +427,53 @@ def compute_math_accuracy(
     truncate_repeated_newlines: bool = False,
 ):
     correct = 0
+    correct_include_fallback = 0
     processed = len(generations)
 
     for item in generations:
-        parsed_answer = extract_math_answer(
-            item.get("generations", ""),
+        gen_text = item.get("generations", "")
+        ground_truth = item.get("ground_truth", "")
+
+        # Strict: <answer> region only.
+        parsed_answer = extract_math_answer_strict(
+            gen_text,
+            truncate_repeated_newlines=truncate_repeated_newlines,
+        )
+        is_correct = parsed_answer is not None and _math_scorer.grade(
+            _preprocess_math_answer(parsed_answer),
+            _preprocess_math_answer(ground_truth),
+        )
+
+        # With fallback: <answer> region + \boxed anywhere.
+        parsed_answer_include_fallback = extract_math_answer(
+            gen_text,
             prompt_style=prompt_style,
             truncate_repeated_newlines=truncate_repeated_newlines,
         )
-        is_correct = parsed_answer is not None and is_equiv(parsed_answer, item.get("ground_truth", ""))
+        is_correct_include_fallback = parsed_answer_include_fallback is not None and _math_scorer.grade(
+            _preprocess_math_answer(parsed_answer_include_fallback),
+            _preprocess_math_answer(ground_truth),
+        )
+
         item["parsed_answer"] = parsed_answer
         item["correct"] = is_correct
+        item["parsed_answer_include_fallback"] = parsed_answer_include_fallback
+        item["correct_include_fallback"] = is_correct_include_fallback
+
         if is_correct:
             correct += 1
+        if is_correct_include_fallback:
+            correct_include_fallback += 1
 
     accuracy = correct / processed * 100 if processed > 0 else 0.0
-    return {"correct": correct, "processed": processed, "accuracy": accuracy}
+    accuracy_include_fallback = correct_include_fallback / processed * 100 if processed > 0 else 0.0
+    return {
+        "correct": correct,
+        "processed": processed,
+        "accuracy": accuracy,
+        "correct_include_fallback": correct_include_fallback,
+        "accuracy_include_fallback": accuracy_include_fallback,
+    }
 
 
 def init_seed(seed):
@@ -506,8 +576,16 @@ def format_generation_for_log(generation: str, max_blank_lines: int = 6) -> str:
 def summarize_annotated_generations(generations):
     processed = len(generations)
     correct = sum(1 for item in generations if item.get("correct") is True)
+    correct_include_fallback = sum(1 for item in generations if item.get("correct_include_fallback") is True)
     accuracy = correct / processed * 100 if processed > 0 else 0.0
-    return {"correct": correct, "processed": processed, "accuracy": accuracy}
+    accuracy_include_fallback = correct_include_fallback / processed * 100 if processed > 0 else 0.0
+    return {
+        "correct": correct,
+        "processed": processed,
+        "accuracy": accuracy,
+        "correct_include_fallback": correct_include_fallback,
+        "accuracy_include_fallback": accuracy_include_fallback,
+    }
 
 
 def build_requested_index_range_label(start_index: int, end_index: int) -> str:
@@ -540,6 +618,8 @@ def build_saved_output(
         "correct": metrics.get("correct"),
         "processed": metrics.get("processed"),
         "accuracy": metrics.get("accuracy"),
+        "correct_include_fallback": metrics.get("correct_include_fallback"),
+        "accuracy_include_fallback": metrics.get("accuracy_include_fallback"),
         "num_skipped": metrics.get("num_skipped", len(metrics.get("skipped_examples", []))),
         "oom_fallback_batches": metrics.get("oom_fallback_batches", 0),
     }
@@ -1197,8 +1277,14 @@ if __name__ == "__main__":
             )
             metrics.update(math_metrics)
             print(
-                f"{args.dataset.upper()} accuracy: {math_metrics['correct']}/{math_metrics['processed']} "
+                f"{args.dataset.upper()} accuracy (strict):           "
+                f"{math_metrics['correct']}/{math_metrics['processed']} "
                 f"({math_metrics['accuracy']:.2f}%)"
+            )
+            print(
+                f"{args.dataset.upper()} accuracy (include_fallback): "
+                f"{math_metrics['correct_include_fallback']}/{math_metrics['processed']} "
+                f"({math_metrics['accuracy_include_fallback']:.2f}%)"
             )
 
         if save_callback is not None:
