@@ -1,4 +1,5 @@
 # directory
+.venv/
 checkpoints/
 __pycache__/
 logs/
