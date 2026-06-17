@@ -175,6 +175,7 @@ def main():
         prompt_type=args.prompt_type,
         target_response_source=args.target_response_source,
         heldout_eval_ratio=args.heldout_eval_ratio,
+        answer_block=args.answer_block,
     )
 
     if args.max_train_samples is not None:
@@ -197,6 +198,9 @@ def main():
         t_sampling_mode=args.t_sampling_mode,
         t_fixed=args.t_fixed,
         t_biased_to_one_strength=args.t_biased_to_one_strength,
+        t_biased_to_zero_strength=args.t_biased_to_zero_strength,
+        t_logit_normal_mean=args.t_logit_normal_mean,
+        t_logit_normal_std=args.t_logit_normal_std,
         t_two_point_low=args.t_two_point_low,
         t_two_point_high=args.t_two_point_high,
         t_two_point_high_prob=args.t_two_point_high_prob,

@@ -59,6 +59,21 @@ RESPONSE_SOURCE_ALIASES = {
     "no_cot": "noncot",
 }
 HELDOUT_SPLIT_NAMES = {"heldout", "eval", "validation", "test"}
+ANSWER_BLOCK_TARGET_TOKEN_LENGTH = 32
+ANSWER_BLOCK_PADDING_CANDIDATES = (
+    " ",
+    "\n",
+    "\t",
+    "  ",
+    "\n\n",
+    "\t\t",
+    " \n",
+    "\n ",
+    " \t",
+    "\t ",
+    "\n\t",
+    "\t\n",
+)
 
 
 def set_random_seed(seed: int = 42):
@@ -115,7 +130,148 @@ def _math_response(solution_text: str) -> str:
     return _safe_str(solution_text).strip()
 
 
-def _format_structured_math_response(solution_text: str, answer_text: str, prompt_type: str) -> str:
+def _count_text_tokens(tokenizer, text: str) -> int:
+    return len(
+        tokenizer(
+            text,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )["input_ids"]
+    )
+
+
+def _render_answer_block(answer_text: str, padding: str = "") -> str:
+    return f"<answer>\n{answer_text}{padding}\n</answer>"
+
+
+def _get_answer_block_token_length(tokenizer, answer_text: str, padding: str = "") -> int:
+    return _count_text_tokens(tokenizer, _render_answer_block(answer_text, padding=padding))
+
+
+def _decode_single_token(tokenizer, token_id: int) -> str:
+    try:
+        return tokenizer.decode(
+            [token_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        return tokenizer.decode([token_id], skip_special_tokens=False)
+
+
+def _get_answer_block_padding_candidates(tokenizer) -> tuple[str, ...]:
+    cached_candidates = getattr(tokenizer, "_answer_block_padding_candidates", None)
+    if cached_candidates is not None:
+        return cached_candidates
+
+    candidates = []
+    seen = set()
+
+    def _register_candidate(candidate: str):
+        if not candidate or candidate in seen or not candidate.isspace():
+            return
+        candidates.append(candidate)
+        seen.add(candidate)
+
+    for candidate in ANSWER_BLOCK_PADDING_CANDIDATES:
+        _register_candidate(candidate)
+
+    for token_id in range(len(tokenizer)):
+        decoded = _decode_single_token(tokenizer, token_id)
+        if decoded and decoded.isspace() and len(decoded) <= 8:
+            _register_candidate(decoded)
+
+    cached_candidates = tuple(candidates)
+    setattr(tokenizer, "_answer_block_padding_candidates", cached_candidates)
+    return cached_candidates
+
+
+def _build_padded_answer_block(tokenizer, answer_text: str, target_token_length: int) -> str:
+    padding_candidates = _get_answer_block_padding_candidates(tokenizer)
+    padding = ""
+    answer_block = _render_answer_block(answer_text)
+    answer_block_token_length = _get_answer_block_token_length(tokenizer, answer_text)
+
+    if answer_block_token_length > target_token_length:
+        raise ValueError(
+            "The `<answer>...</answer>` block already exceeds the requested fixed token length "
+            f"({answer_block_token_length} > {target_token_length})."
+        )
+
+    while answer_block_token_length < target_token_length:
+        remaining_tokens = target_token_length - answer_block_token_length
+        next_padding = None
+
+        for candidate in padding_candidates:
+            candidate_padding = padding + candidate
+            candidate_block = _render_answer_block(answer_text, padding=candidate_padding)
+            candidate_length = _get_answer_block_token_length(
+                tokenizer,
+                answer_text,
+                padding=candidate_padding,
+            )
+            token_increase = candidate_length - answer_block_token_length
+
+            if token_increase <= 0 or token_increase > remaining_tokens:
+                continue
+            if token_increase == remaining_tokens or token_increase == 1:
+                next_padding = candidate_padding
+                answer_block = candidate_block
+                answer_block_token_length = candidate_length
+                break
+
+        if next_padding is None:
+            raise ValueError(
+                "Failed to pad the `<answer>...</answer>` block to the requested fixed token length "
+                f"({target_token_length}) using whitespace-only padding."
+            )
+
+        padding = next_padding
+
+    return answer_block
+
+
+def _is_answer_block_within_token_budget(
+    example: dict,
+    tokenizer,
+    target_token_length: int,
+) -> bool:
+    answer_text = _safe_str(example.get("answer")).strip()
+    if not answer_text:
+        return True
+    return _get_answer_block_token_length(tokenizer, answer_text) <= target_token_length
+
+
+def _filter_oversized_answer_block_examples(
+    raw_dataset: Dataset,
+    tokenizer,
+    target_token_length: int,
+) -> Dataset:
+    original_size = len(raw_dataset)
+    filtered_dataset = raw_dataset.filter(
+        lambda example: _is_answer_block_within_token_budget(
+            example,
+            tokenizer=tokenizer,
+            target_token_length=target_token_length,
+        )
+    )
+    filtered_count = original_size - len(filtered_dataset)
+    if filtered_count > 0:
+        print(
+            "Filtered out "
+            f"{filtered_count} examples whose `<answer>...</answer>` block exceeded "
+            f"{target_token_length} tokens."
+        )
+    return filtered_dataset
+
+
+def _format_structured_math_response(
+    solution_text: str,
+    answer_text: str,
+    prompt_type: str,
+    tokenizer=None,
+    answer_block: bool = False,
+) -> str:
     normalized_prompt_type = _normalize_prompt_type(prompt_type)
     solution_text = _math_response(solution_text)
     answer_text = _safe_str(answer_text).strip()
@@ -135,6 +291,16 @@ def _format_structured_math_response(solution_text: str, answer_text: str, promp
         )
 
     if normalized_prompt_type == "answer_first":
+        if answer_block:
+            if tokenizer is None:
+                raise ValueError("`answer_block=True` requires a tokenizer.")
+            answer_section = _build_padded_answer_block(
+                tokenizer=tokenizer,
+                answer_text=answer_text,
+                target_token_length=ANSWER_BLOCK_TARGET_TOKEN_LENGTH,
+            )
+            return f"{answer_section}\n<reasoning>\n{solution_text}\n</reasoning>"
+
         return (
             f"<answer>\n{answer_text}\n</answer>\n"
             f"<reasoning>\n{solution_text}\n</reasoning>"
@@ -215,6 +381,7 @@ def _format_example(
     tokenizer,
     prompt_type: str,
     target_response_source: str,
+    answer_block: bool,
 ) -> dict:
     question = _safe_str(example.get("question")).strip()
     answer = _safe_str(example.get("answer")).strip()
@@ -228,6 +395,8 @@ def _format_example(
         solution_text=target_raw_response,
         answer_text=answer,
         prompt_type=prompt_type,
+        tokenizer=tokenizer,
+        answer_block=answer_block,
     )
 
     return {
@@ -250,14 +419,25 @@ def _format_dataset(
     tokenizer,
     prompt_type: str,
     target_response_source: str,
+    answer_block: bool,
 ) -> Dataset:
-    columns_to_remove = list(raw_dataset.column_names)
-    return raw_dataset.map(
+    normalized_prompt_type = _normalize_prompt_type(prompt_type)
+    filtered_dataset = raw_dataset
+    if answer_block and normalized_prompt_type == "answer_first":
+        filtered_dataset = _filter_oversized_answer_block_examples(
+            raw_dataset,
+            tokenizer=tokenizer,
+            target_token_length=ANSWER_BLOCK_TARGET_TOKEN_LENGTH,
+        )
+
+    columns_to_remove = list(filtered_dataset.column_names)
+    return filtered_dataset.map(
         lambda example: _format_example(
             example,
             tokenizer=tokenizer,
-            prompt_type=prompt_type,
+            prompt_type=normalized_prompt_type,
             target_response_source=target_response_source,
+            answer_block=answer_block,
         ),
         remove_columns=columns_to_remove,
     )
@@ -272,6 +452,7 @@ def get_distillation_datasets(
     prompt_type: str = "default",
     target_response_source: str = "cot",
     heldout_eval_ratio: float = 0.01,
+    answer_block: bool = False,
 ):
     prompt_type = _normalize_prompt_type(prompt_type)
     target_response_source = _normalize_response_source(
@@ -292,6 +473,7 @@ def get_distillation_datasets(
         tokenizer=tokenizer,
         prompt_type=prompt_type,
         target_response_source=target_response_source,
+        answer_block=answer_block,
     )
     eval_dataset = (
         _format_dataset(
@@ -299,6 +481,7 @@ def get_distillation_datasets(
             tokenizer=tokenizer,
             prompt_type=prompt_type,
             target_response_source=target_response_source,
+            answer_block=answer_block,
         )
         if eval_raw is not None
         else None

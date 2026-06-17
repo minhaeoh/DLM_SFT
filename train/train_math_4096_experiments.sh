@@ -6,8 +6,8 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TRAIN_DIR="${ROOT_DIR}/train"
 TRAIN_SCRIPT="${TRAIN_DIR}/long_cot_train.py"
 ENV_FILE="${ROOT_DIR}/.env"
-LOCAL_DATASET_PATH="${ROOT_DIR}/datasets/Math-CoT-NoCoT-20k-format-4096"
-FALLBACK_DATASET_PATH="/home/minhae/diffusion/diffu-distill/d1-self-distill/dataset/Math-CoT-NoCoT-20k-format-4096"
+LOCAL_DATASET_PATH="${ROOT_DIR}/datasets/OpenR1-Math-220k-CoT-format-4096"
+FALLBACK_DATASET_PATH="/home/minhae/diffusion/DLM_SFT/datasets/OpenR1-Math-220k-CoT-format-4096"
 LOCAL_DATASET_LABEL="${LOCAL_DATASET_PATH%/}"
 LOCAL_DATASET_LABEL="${LOCAL_DATASET_LABEL##*/}"
 cd "${TRAIN_DIR}"
@@ -60,6 +60,7 @@ GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-False}"
 CE_WEIGHT="${CE_WEIGHT:-0.5}"
 PROMPT_STYLE="${PROMPT_STYLE:-default}"
 OVERWRITE_OUTPUT_DIR="${OVERWRITE_OUTPUT_DIR:-0}"
+SAVE_CHECKPOINTS="${SAVE_CHECKPOINTS:-1}"
 BASE_MAIN_PROCESS_PORT="${BASE_MAIN_PROCESS_PORT:-29600}"
 
 if [[ -f "${ENV_FILE}" ]]; then
@@ -92,14 +93,38 @@ compute_dataset_stats() {
   local dataset_path="$1"
   DATASET_PATH_FOR_STATS="${dataset_path}" "${PYTHON_BIN}" - <<PY
 import os
-from datasets import load_from_disk
+import sys
 from math import ceil
 
 dataset_path = os.environ["DATASET_PATH_FOR_STATS"]
 heldout_ratio = float("${HELDOUT_EVAL_RATIO}")
 effective_batch = int("${BATCH_SIZE}")
 
-total_size = len(load_from_disk(dataset_path)["train"])
+def count_train_rows(path):
+    try:
+        from datasets import load_from_disk
+        return len(load_from_disk(path)["train"])
+    except Exception:
+        pass
+    # Fallback: read num_rows from dataset_info.json
+    try:
+        import json
+        with open(os.path.join(path, "train", "dataset_info.json")) as f:
+            info = json.load(f)
+        n = info.get("num_rows")
+        if n is not None:
+            return int(n)
+    except Exception:
+        pass
+    # Last resort: count via pyarrow directly
+    import glob
+    import pyarrow as pa
+    arrow_files = sorted(glob.glob(os.path.join(path, "train", "*.arrow")))
+    if not arrow_files:
+        raise RuntimeError(f"No Arrow files found under {path}/train/")
+    return sum(pa.ipc.open_file(f).read_all().num_rows for f in arrow_files)
+
+total_size = count_train_rows(dataset_path)
 eval_size = max(int(round(total_size * heldout_ratio)), 1)
 eval_size = min(eval_size, total_size - 1)
 train_size = total_size - eval_size
@@ -158,6 +183,7 @@ echo "BF16                        : ${BF16}"
 echo "GRADIENT_CHECKPOINTING      : ${GRADIENT_CHECKPOINTING}"
 echo "CE_WEIGHT                   : ${CE_WEIGHT}"
 echo "PROMPT_STYLE                : ${PROMPT_STYLE}"
+echo "SAVE_CHECKPOINTS            : ${SAVE_CHECKPOINTS}"
 echo "TOTAL_SIZE                  : ${TOTAL_SIZE}"
 echo "TRAIN_SIZE                  : ${TRAIN_SIZE}"
 echo "EVAL_SIZE                   : ${EVAL_SIZE}"
@@ -171,10 +197,16 @@ run_experiment() {
   local target_source="$2"
   local run_index="$3"
   local prompt_style="${PROMPT_STYLE}"
+  local answer_block="False"
   local effective_dataset_path="${DATASET_PATH}"
   if [[ $# -ge 4 && "${4}" != --* ]]; then
     prompt_style="$4"
-    shift 4
+    if [[ $# -ge 5 && "${5}" != --* ]]; then
+      answer_block="$5"
+      shift 5
+    else
+      shift 4
+    fi
   else
     shift 3
   fi
@@ -186,6 +218,9 @@ run_experiment() {
   local prompt_style_label=""
   local extra_t_sampling_mode=""
   local extra_t_biased_to_one_strength="2.0"
+  local extra_t_biased_to_zero_strength="2.0"
+  local extra_t_logit_normal_mean="0.0"
+  local extra_t_logit_normal_std="1.0"
   local extra_arg_idx=0
   local effective_dataset_label="${DATASET_LABEL}"
   local effective_output_root="${OUTPUT_ROOT}"
@@ -235,6 +270,45 @@ run_experiment() {
         filtered_extra_train_args+=("${extra_arg}" "${extra_train_args[$((extra_arg_idx + 1))]}")
         extra_arg_idx=$((extra_arg_idx + 1))
         ;;
+      --t_biased_to_zero_strength=*)
+        extra_t_biased_to_zero_strength="${extra_arg#*=}"
+        filtered_extra_train_args+=("${extra_arg}")
+        ;;
+      --t_biased_to_zero_strength)
+        if [[ $((extra_arg_idx + 1)) -ge "${#extra_train_args[@]}" ]]; then
+          echo "--t_biased_to_zero_strength requires a value." >&2
+          exit 1
+        fi
+        extra_t_biased_to_zero_strength="${extra_train_args[$((extra_arg_idx + 1))]}"
+        filtered_extra_train_args+=("${extra_arg}" "${extra_train_args[$((extra_arg_idx + 1))]}")
+        extra_arg_idx=$((extra_arg_idx + 1))
+        ;;
+      --t_logit_normal_mean=*)
+        extra_t_logit_normal_mean="${extra_arg#*=}"
+        filtered_extra_train_args+=("${extra_arg}")
+        ;;
+      --t_logit_normal_mean)
+        if [[ $((extra_arg_idx + 1)) -ge "${#extra_train_args[@]}" ]]; then
+          echo "--t_logit_normal_mean requires a value." >&2
+          exit 1
+        fi
+        extra_t_logit_normal_mean="${extra_train_args[$((extra_arg_idx + 1))]}"
+        filtered_extra_train_args+=("${extra_arg}" "${extra_train_args[$((extra_arg_idx + 1))]}")
+        extra_arg_idx=$((extra_arg_idx + 1))
+        ;;
+      --t_logit_normal_std=*)
+        extra_t_logit_normal_std="${extra_arg#*=}"
+        filtered_extra_train_args+=("${extra_arg}")
+        ;;
+      --t_logit_normal_std)
+        if [[ $((extra_arg_idx + 1)) -ge "${#extra_train_args[@]}" ]]; then
+          echo "--t_logit_normal_std requires a value." >&2
+          exit 1
+        fi
+        extra_t_logit_normal_std="${extra_train_args[$((extra_arg_idx + 1))]}"
+        filtered_extra_train_args+=("${extra_arg}" "${extra_train_args[$((extra_arg_idx + 1))]}")
+        extra_arg_idx=$((extra_arg_idx + 1))
+        ;;
       *)
         filtered_extra_train_args+=("${extra_arg}")
         ;;
@@ -259,7 +333,7 @@ run_experiment() {
   if [[ "${OUTPUT_ROOT_IS_EXPLICIT}" == "1" ]]; then
     effective_output_root="${OUTPUT_ROOT}"
   else
-    effective_output_root="${OUTPUT_ROOT_BASE}/${effective_dataset_label}/${MODEL_LABEL}"
+    effective_output_root="${OUTPUT_ROOT_BASE}/${effective_dataset_label}/${MODEL_LABEL}/WO_EOS"
   fi
 
   read -r run_total_size run_eval_size run_train_size run_steps_per_epoch run_half_epoch_save_steps <<< \
@@ -278,10 +352,19 @@ run_experiment() {
   esac
 
   run_method_label="${run_method_label}_${prompt_style_label}"
+  if [[ "$(printf '%s' "${answer_block}" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
+    run_method_label="${run_method_label}_answer_block"
+  fi
 
   case "${extra_t_sampling_mode}" in
     biased_to_one|biased-to-one|biasedtoone|high-bias|highbias)
       run_method_label="${run_method_label}_tbiased_w${extra_t_biased_to_one_strength}"
+      ;;
+    biased_to_zero|biased-to-zero|biasedtozero|low-bias|lowbias)
+      run_method_label="${run_method_label}_tbiased_zero_w${extra_t_biased_to_zero_strength}"
+      ;;
+    logit_normal|logit-normal|logitnormal)
+      run_method_label="${run_method_label}_tlogit_m${extra_t_logit_normal_mean}_s${extra_t_logit_normal_std}"
       ;;
   esac
 
@@ -305,6 +388,7 @@ run_experiment() {
   echo "RUN_METHOD_LABEL             : ${run_method_label}"
   echo "TARGET_RESPONSE_SOURCE       : ${target_source}"
   echo "PROMPT_STYLE                 : ${prompt_style}"
+  echo "ANSWER_BLOCK                 : ${answer_block}"
   echo "DATASET_PATH                 : ${effective_dataset_path}"
   echo "DATASET_LABEL                : ${effective_dataset_label}"
   echo "EFFECTIVE_CE_WEIGHT          : ${effective_ce_weight}"
@@ -336,6 +420,7 @@ run_experiment() {
     --method "${method}"
     --target_response_source "${target_source}"
     --prompt_type "${prompt_style}"
+    --answer_block "${answer_block}"
     --output_dir "${output_dir}"
     --run_name "${run_name}"
     --train_split train
@@ -350,11 +435,8 @@ run_experiment() {
     --max_length "${MAX_LENGTH}"
     --logging_strategy steps
     --logging_steps "${LOGGING_STEPS}"
-    --save_strategy steps
-    --save_steps "${run_half_epoch_save_steps}"
     --eval_strategy steps
     --eval_steps "${run_half_epoch_save_steps}"
-    --save_total_limit "${SAVE_TOTAL_LIMIT}"
     --bf16 "${BF16}"
     --gradient_checkpointing "${GRADIENT_CHECKPOINTING}"
     --remove_unused_columns False
@@ -364,6 +446,16 @@ run_experiment() {
     --seed "${SEED}"
     --ce_weight "${effective_ce_weight}"
   )
+
+  if [[ "${SAVE_CHECKPOINTS}" == "1" ]]; then
+    cmd+=(
+      --save_strategy steps
+      --save_steps "${run_half_epoch_save_steps}"
+      --save_total_limit "${SAVE_TOTAL_LIMIT}"
+    )
+  else
+    cmd+=(--save_strategy no)
+  fi
 
   if [[ "${OVERWRITE_OUTPUT_DIR}" == "1" ]]; then
     cmd+=(--overwrite_output_dir True)
@@ -381,19 +473,28 @@ run_experiment() {
   echo "Saved run log to             : ${run_log_file}"
 }
 
-run_experiment "SFT" "noncot" 0 "format"
-run_experiment "SFT" "noncot" 0 "answer_first"
-run_experiment "SFT" "cot" 0 "format"
-run_experiment "SFT" "cot" 0 "answer_first"
-run_experiment "SFT" "noncot" 0 "format" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/Math-NoCoT-format-4096"
-run_experiment "SFT" "noncot" 0 "answer_first" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/Math-NoCoT-format-4096"
-# run_experiment "SFT" "cot" 1
-# run_experiment "SFT" "noncot" 2 \
-#   --t_sampling_mode=biased_to_one \
-#   --t_biased_to_one_strength=2.0
-# run_experiment "SFT" "cot" 3 \
-#   --t_sampling_mode=biased_to_one \
-#   --t_biased_to_one_strength=2.0
+# run_experiment "SFT" "noncot" 0 "format" --ce_weight 0.0
+# run_experiment "SFT" "noncot" 0 "format" --t_sampling_mode=logit_normal --t_logit_normal_mean=0.5 --t_logit_normal_std=1.0
+# run_experiment "SFT" "noncot" 1 "format" 
+# run_experiment "SFT" "noncot" 2 "format" --t_sampling_mode=biased_to_one --t_biased_to_one_strength=2.0 
+# run_experiment "SFT" "noncot" 3 "format" --t_sampling_mode=biased_to_zero --t_biased_to_zero_strength=2.0 
+# run_experiment "SFT" "noncot" 4 "format" --t_sampling_mode=logit_normal --t_logit_normal_mean=0.0 --t_logit_normal_std=1.0 
+# run_experiment "SFT" "noncot" 5 "format" --t_sampling_mode=logit_normal --t_logit_normal_mean=-0.5 --t_logit_normal_std=1.0 
+# run_experiment "SFT" "noncot" 0 "answer_first" "True"
+# run_experiment "SFT" "noncot" 1 "format" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/Math-NoCoT-format-4096-3k"
+# run_experiment "SFT" "noncot" 1 "format"
+# run_experiment "SFT" "noncot" 1 "format" --t_sampling_mode=biased_to_one --t_biased_to_one_strength=2.0
+# run_experiment "SFT" "noncot" 2 "format" --t_sampling_mode=biased_to_one --t_biased_to_one_strength=1.0
+# run_experiment "SFT" "noncot" 3 "format" --t_sampling_mode=biased_to_one --t_biased_to_one_strength=3.0
+# run_experiment "SFT" "cot" 10 "format" 
+run_experiment "SFT" "cot" 10 "format" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/OpenR1-Math-220k-CoT-format-4096-24k"
+run_experiment "SFT" "cot" 10 "format" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/OpenR1-Math-220k-CoT-format-4096-3k"
+run_experiment "SFT" "cot" 10 "format" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/OpenR1-Math-220k-CoT-format-4096-6k"
+run_experiment "SFT" "cot" 10 "format" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/OpenR1-Math-220k-CoT-format-4096-12k"
+
+# run_experiment "SFT" "noncot" 0 "format" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/Math-NoCoT-format-4096"
+# run_experiment "SFT" "noncot" 0 "answer_first" --dataset_path "/home/minhae/diffusion/DLM_SFT/datasets/Math-NoCoT-format-4096"
+
 # Example: switch prompt style per run.
 # run_experiment "SFT" "cot" 4 "format"
 # Example: switch dataset path for one run.
@@ -404,6 +505,20 @@ run_experiment "SFT" "noncot" 0 "answer_first" --dataset_path "/home/minhae/diff
 #   --t_sampling_mode=uniform \
 #   --t_min=0.2 \
 #   --t_max=0.9
+# Example: bias toward low t (light masking).
+# run_experiment "SFT" "noncot" 0 "format" \
+#   --t_sampling_mode=biased_to_zero \
+#   --t_biased_to_zero_strength=2.0
+# # Example: logit-normal, mass centered at t=0.5 (medium masking).
+# run_experiment "SFT" "noncot" 0 "format" \
+#   --t_sampling_mode=logit_normal \
+#   --t_logit_normal_mean=0.0 \
+#   --t_logit_normal_std=1.0
+# # Example: logit-normal shifted toward lower t (mean=-0.5 -> mass near t~0.4).
+# run_experiment "SFT" "noncot" 0 "format" \
+#   --t_sampling_mode=logit_normal \
+#   --t_logit_normal_mean=0.5 \
+#   --t_logit_normal_std=1.0
 
 echo
 echo "All long-CoT runs completed."

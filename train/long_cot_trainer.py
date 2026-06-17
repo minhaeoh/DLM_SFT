@@ -23,12 +23,30 @@ T_SAMPLING_MODE_ALIASES = {
     "biasedtoone": "biased_to_one",
     "high-bias": "biased_to_one",
     "highbias": "biased_to_one",
+    "biased-to-zero": "biased_to_zero",
+    "biasedtozero": "biased_to_zero",
+    "low-bias": "biased_to_zero",
+    "lowbias": "biased_to_zero",
+    "logit-normal": "logit_normal",
+    "logitnormal": "logit_normal",
     "two-point": "two_point",
     "twopoint": "two_point",
 }
-VALID_T_SAMPLING_MODES = {"uniform", "fixed", "two_point", "curriculum", "biased_to_one"}
-TOP1_LOGIT_DEBUG_STEPS_PER_EPOCH = 30
-TOP1_LOGIT_DEBUG_FILENAME = "debug_top1_logits_first100.jsonl"
+VALID_T_SAMPLING_MODES = {"uniform", "fixed", "two_point", "curriculum", "biased_to_one", "biased_to_zero", "logit_normal"}
+TOP1_LOGIT_DEBUG_STEPS_PER_EPOCH = 120
+
+# t 구간별 심층 진단 메트릭 추적: (이름, low_inclusive, high_exclusive)
+# 0~1을 0.1 단위 10개 구간으로 분할
+T_BIN_DEFS = [
+    (f"t{i}", round(i * 0.1, 2), round((i + 1) * 0.1, 2) if i < 9 else 1.01)
+    for i in range(10)
+]
+# bin-to-bin gradient cosine similarity를 기록할 인접 구간 쌍
+T_BIN_ADJACENT_PAIRS = [(T_BIN_DEFS[i][0], T_BIN_DEFS[i + 1][0]) for i in range(len(T_BIN_DEFS) - 1)]
+T_BIN_LOW_NAMES = [name for name, _, _ in T_BIN_DEFS[:5]]
+T_BIN_HIGH_NAMES = [name for name, _, _ in T_BIN_DEFS[5:]]
+TOP1_LOGIT_DEBUG_TOPK = 5
+TOP1_LOGIT_DEBUG_FILENAME = "debug_top1_logits.jsonl"
 
 
 def _normalize_method_name(method: str) -> str:
@@ -82,6 +100,62 @@ def sample_t_biased_to_one(
     return epsilon + (t_max - epsilon) * x
 
 
+def sample_t_biased_to_zero(
+    batch_size: int,
+    device: torch.device | None = None,
+    t_min: float = 0.0,
+    t_max: float = 1.0,
+    strength: float = 2.0,
+) -> torch.Tensor:
+    if batch_size <= 0:
+        kwargs = {"dtype": torch.float32}
+        if device is not None:
+            kwargs["device"] = device
+        return torch.empty(0, **kwargs)
+
+    t_min = float(t_min)
+    t_max = float(t_max)
+    strength = float(strength)
+    if strength <= 0.0:
+        raise ValueError("`strength` must be > 0.")
+
+    rand_kwargs = {"dtype": torch.float32}
+    if device is not None:
+        rand_kwargs["device"] = device
+    u = torch.rand(batch_size, **rand_kwargs)
+    # u^(1/strength) biases toward 1; flipping gives bias toward 0
+    x = 1.0 - u.pow(1.0 / strength)
+    return t_min + (t_max - t_min) * x
+
+
+def sample_t_logit_normal(
+    batch_size: int,
+    device: torch.device | None = None,
+    t_min: float = 0.0,
+    t_max: float = 1.0,
+    mean: float = 0.0,
+    std: float = 1.0,
+) -> torch.Tensor:
+    if batch_size <= 0:
+        kwargs = {"dtype": torch.float32}
+        if device is not None:
+            kwargs["device"] = device
+        return torch.empty(0, **kwargs)
+
+    t_min = float(t_min)
+    t_max = float(t_max)
+    std = float(std)
+    if std <= 0.0:
+        raise ValueError("`std` must be > 0.")
+
+    rand_kwargs = {"dtype": torch.float32}
+    if device is not None:
+        rand_kwargs["device"] = device
+    z = torch.randn(batch_size, **rand_kwargs) * std + mean
+    t_raw = torch.sigmoid(z)
+    return t_min + (t_max - t_min) * t_raw
+
+
 def disable_dropout_in_model(model: torch.nn.Module):
     for module in model.modules():
         if isinstance(module, nn.Dropout):
@@ -114,6 +188,9 @@ class DiffuSelfDistillDataCollator:
         t_sampling_mode: str = "uniform",
         t_fixed: float = 0.9,
         t_biased_to_one_strength: float = 2.0,
+        t_biased_to_zero_strength: float = 2.0,
+        t_logit_normal_mean: float = 0.0,
+        t_logit_normal_std: float = 1.0,
         t_two_point_low: float = 0.2,
         t_two_point_high: float = 0.9,
         t_two_point_high_prob: float = 0.5,
@@ -132,6 +209,9 @@ class DiffuSelfDistillDataCollator:
         self.t_sampling_mode = normalize_t_sampling_mode(t_sampling_mode)
         self.t_fixed = float(min(max(t_fixed, 0.0), 1.0))
         self.t_biased_to_one_strength = float(t_biased_to_one_strength)
+        self.t_biased_to_zero_strength = float(t_biased_to_zero_strength)
+        self.t_logit_normal_mean = float(t_logit_normal_mean)
+        self.t_logit_normal_std = float(t_logit_normal_std)
         self.t_two_point_low = float(min(max(t_two_point_low, 0.0), 1.0))
         self.t_two_point_high = float(min(max(t_two_point_high, 0.0), 1.0))
         self.t_two_point_high_prob = float(min(max(t_two_point_high_prob, 0.0), 1.0))
@@ -149,15 +229,16 @@ class DiffuSelfDistillDataCollator:
         if self.pad_token_id is None:
             raise ValueError("Tokenizer must provide pad_token_id or eos_token_id.")
         self.fallback_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else self.pad_token_id
-        self.response_terminal_token_id = (
-            tokenizer.eos_token_id if tokenizer.eos_token_id is not None else self.fallback_token_id
-        )
 
     def _validate_t_sampling_settings(self):
         if self.t_min > self.t_max:
             raise ValueError(f"`t_min` ({self.t_min}) must be <= `t_max` ({self.t_max}).")
         if self.t_biased_to_one_strength <= 0.0:
             raise ValueError("`t_biased_to_one_strength` must be > 0.")
+        if self.t_biased_to_zero_strength <= 0.0:
+            raise ValueError("`t_biased_to_zero_strength` must be > 0.")
+        if self.t_logit_normal_std <= 0.0:
+            raise ValueError("`t_logit_normal_std` must be > 0.")
         if self.t_two_point_low > self.t_two_point_high:
             raise ValueError("`t_two_point_low` must be <= `t_two_point_high`.")
         if self.t_curriculum_start_min > self.t_curriculum_start_max:
@@ -190,6 +271,23 @@ class DiffuSelfDistillDataCollator:
                 epsilon=self.t_min,
                 strength=self.t_biased_to_one_strength,
                 t_max=self.t_max,
+            )
+
+        if self.t_sampling_mode == "biased_to_zero":
+            return sample_t_biased_to_zero(
+                batch_size,
+                t_min=self.t_min,
+                t_max=self.t_max,
+                strength=self.t_biased_to_zero_strength,
+            )
+
+        if self.t_sampling_mode == "logit_normal":
+            return sample_t_logit_normal(
+                batch_size,
+                t_min=self.t_min,
+                t_max=self.t_max,
+                mean=self.t_logit_normal_mean,
+                std=self.t_logit_normal_std,
             )
 
         if self.t_sampling_mode == "two_point":
@@ -304,7 +402,9 @@ class DiffuSelfDistillTrainer(Trainer):
         self._top1_logit_debug_initialized = False
         self._top1_logit_debug_epoch_index = -1
         self._top1_logit_debug_logged_steps_in_epoch = 0
+        self._top1_logit_debug_seen_step_count_in_epoch = 0
         self._top1_logit_debug_seen_global_steps_in_epoch: set[int] = set()
+        self._top1_logit_debug_stride_value: int | None = None
         self._reset_interval_log_accumulators()
 
     def _infer_t_sampling_total_batches(self, train_dataloader) -> int:
@@ -371,6 +471,26 @@ class DiffuSelfDistillTrainer(Trainer):
             "student_masked_tokens": 0.0,
             "batch_sft_frac": 0.0,
         }
+        # t 구간별 심층 진단 메트릭 누적 (token/sample 수로 나눠 평균)
+        self._t_bin_accum = {
+            name: {
+                "loss_sum": 0.0,
+                "loss_count": 0,
+                "correct1": 0,
+                "correct5": 0,
+                "total": 0,
+                "sample_count": 0,
+                "entropy_sum": 0.0,
+                "margin_sum": 0.0,
+                # softmax(logits) - one_hot(target)를 마스킹 토큰에 대해 평균낸 벡터.
+                # CE loss의 logits에 대한 그라디언트와 동일한 방향으로,
+                # 별도 backward 없이 bin별 그라디언트 충돌/분산을 근사하는 데 사용.
+                "grad_vec_sum": None,
+                "grad_norm_sum": 0.0,
+                "grad_sqnorm_sum": 0.0,
+            }
+            for name, _, _ in T_BIN_DEFS
+        }
 
     def _accumulate_interval_log_metrics(
         self,
@@ -399,6 +519,45 @@ class DiffuSelfDistillTrainer(Trainer):
             interval_count = float(self._interval_log_count)
             for key, total in self._interval_log_sums.items():
                 log_payload[key] = total / interval_count
+            # t 구간별 심층 진단 메트릭: token/sample 수 기준으로 평균
+            mean_grad_vecs: dict[str, torch.Tensor] = {}
+            for name, acc in self._t_bin_accum.items():
+                if acc["loss_count"] > 0:
+                    log_payload[f"loss/{name}"] = acc["loss_sum"] / acc["loss_count"]
+                if acc["total"] > 0:
+                    log_payload[f"acc_top1/{name}"] = acc["correct1"] / acc["total"]
+                    log_payload[f"acc_top5/{name}"] = acc["correct5"] / acc["total"]
+                    log_payload[f"entropy/{name}"] = acc["entropy_sum"] / acc["total"]
+                    log_payload[f"margin/{name}"] = acc["margin_sum"] / acc["total"]
+                log_payload[f"n_tokens/{name}"] = float(acc["total"])
+                log_payload[f"n_samples/{name}"] = float(acc["sample_count"])
+                if acc["sample_count"] > 0 and acc["grad_vec_sum"] is not None:
+                    mean_vec = acc["grad_vec_sum"] / acc["sample_count"]
+                    mean_grad_vecs[name] = mean_vec
+                    log_payload[f"grad_norm/{name}"] = acc["grad_norm_sum"] / acc["sample_count"]
+                    mean_sqnorm = acc["grad_sqnorm_sum"] / acc["sample_count"]
+                    log_payload[f"grad_var/{name}"] = max(
+                        mean_sqnorm - float(mean_vec.norm(p=2).item()) ** 2, 0.0
+                    )
+
+            # bin-to-bin gradient cosine similarity (인접 구간 + low-vs-high)
+            for low_name, high_name in T_BIN_ADJACENT_PAIRS:
+                if low_name in mean_grad_vecs and high_name in mean_grad_vecs:
+                    cos_sim = F.cosine_similarity(
+                        mean_grad_vecs[low_name].unsqueeze(0),
+                        mean_grad_vecs[high_name].unsqueeze(0),
+                    ).item()
+                    log_payload[f"grad_cos/{low_name}_vs_{high_name}"] = cos_sim
+
+            low_vecs = [mean_grad_vecs[name] for name in T_BIN_LOW_NAMES if name in mean_grad_vecs]
+            high_vecs = [mean_grad_vecs[name] for name in T_BIN_HIGH_NAMES if name in mean_grad_vecs]
+            if low_vecs and high_vecs:
+                low_mean = torch.stack(low_vecs).mean(dim=0)
+                high_mean = torch.stack(high_vecs).mean(dim=0)
+                log_payload["grad_cos/low_vs_high"] = F.cosine_similarity(
+                    low_mean.unsqueeze(0), high_mean.unsqueeze(0)
+                ).item()
+
             self._reset_interval_log_accumulators()
         return super().log(log_payload, *args, **kwargs)
 
@@ -456,7 +615,23 @@ class DiffuSelfDistillTrainer(Trainer):
             return 0
         return max(int(math.floor(float(epoch_value) + 1e-8)), 0)
 
+    def _estimate_steps_per_epoch(self) -> int:
+        num_epochs = float(getattr(self.args, "num_train_epochs", 0) or 0)
+        max_steps = int(getattr(self.state, "max_steps", 0) or 0)
+        if num_epochs > 0 and max_steps > 0:
+            return max(1, int(round(max_steps / num_epochs)))
+        return TOP1_LOGIT_DEBUG_STEPS_PER_EPOCH
+
+    def _top1_logit_debug_stride(self) -> int:
+        if self._top1_logit_debug_stride_value is None:
+            steps_per_epoch = self._estimate_steps_per_epoch()
+            self._top1_logit_debug_stride_value = max(1, steps_per_epoch // TOP1_LOGIT_DEBUG_STEPS_PER_EPOCH)
+        return self._top1_logit_debug_stride_value
+
     def _reserve_top1_logit_debug_step(self) -> tuple[int, int, int] | None:
+        """Pick steps spread evenly across each epoch (instead of only the first
+        N steps), so the debug log represents the whole epoch and can be
+        compared meaningfully against that epoch's eval accuracy."""
         current_step = int(self.state.global_step)
         if current_step < 0:
             return None
@@ -465,15 +640,21 @@ class DiffuSelfDistillTrainer(Trainer):
         if epoch_index != self._top1_logit_debug_epoch_index:
             self._top1_logit_debug_epoch_index = epoch_index
             self._top1_logit_debug_logged_steps_in_epoch = 0
+            self._top1_logit_debug_seen_step_count_in_epoch = 0
             self._top1_logit_debug_seen_global_steps_in_epoch = set()
 
         if current_step in self._top1_logit_debug_seen_global_steps_in_epoch:
             return None
+        self._top1_logit_debug_seen_global_steps_in_epoch.add(current_step)
+        seen_step_index = self._top1_logit_debug_seen_step_count_in_epoch
+        self._top1_logit_debug_seen_step_count_in_epoch += 1
+
         if self._top1_logit_debug_logged_steps_in_epoch >= TOP1_LOGIT_DEBUG_STEPS_PER_EPOCH:
+            return None
+        if seen_step_index % self._top1_logit_debug_stride() != 0:
             return None
 
         epoch_step_index = self._top1_logit_debug_logged_steps_in_epoch
-        self._top1_logit_debug_seen_global_steps_in_epoch.add(current_step)
         self._top1_logit_debug_logged_steps_in_epoch += 1
         return current_step, epoch_index, epoch_step_index
 
@@ -490,6 +671,49 @@ class DiffuSelfDistillTrainer(Trainer):
         masked_logits = response_logits.index_select(0, masked_positions).detach().float()
         top1_logits = masked_logits.max(dim=-1).values
         return [float(value.item()) for value in top1_logits.cpu()]
+
+    def _masked_losses(
+        self,
+        response_logits: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        masked_positions: torch.Tensor,
+    ) -> list[float]:
+        """Per-masked-token cross-entropy loss, parallel to `student_top1_logits`."""
+        if masked_positions.numel() == 0:
+            return []
+        masked_logits = response_logits.index_select(0, masked_positions).detach().float()
+        masked_targets = target_token_ids.index_select(0, masked_positions).detach().to(
+            device=masked_logits.device,
+            dtype=torch.long,
+        )
+        losses = F.cross_entropy(masked_logits, masked_targets, reduction="none")
+        return [float(value.item()) for value in losses.cpu()]
+
+    def _masked_entropy(self, response_logits: torch.Tensor, masked_positions: torch.Tensor) -> list[float]:
+        """Entropy of the full softmax distribution at each masked position (nats);
+        a direct measure of how many candidates the model is weighing (exploration)."""
+        if masked_positions.numel() == 0:
+            return []
+        masked_logits = response_logits.index_select(0, masked_positions).detach().float()
+        log_probs = F.log_softmax(masked_logits, dim=-1)
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1)
+        return [float(value.item()) for value in entropy.cpu()]
+
+    def _masked_topk(
+        self,
+        response_logits: torch.Tensor,
+        masked_positions: torch.Tensor,
+        k: int,
+    ) -> tuple[list[list[int]], list[list[float]]]:
+        """Top-k candidate token ids and probabilities at each masked position;
+        lets exploration be analyzed via margin / cumulative mass, not just top-1."""
+        if masked_positions.numel() == 0:
+            return [], []
+        masked_logits = response_logits.index_select(0, masked_positions).detach().float()
+        probs = F.softmax(masked_logits, dim=-1)
+        topk_probs, topk_ids = probs.topk(min(k, probs.shape[-1]), dim=-1)
+        return topk_ids.cpu().tolist(), topk_probs.cpu().tolist()
 
     def _token_ids_to_pieces(self, token_ids: list[int]) -> list[str]:
         if not token_ids:
@@ -625,14 +849,13 @@ class DiffuSelfDistillTrainer(Trainer):
             kd_positions = torch.nonzero(kd_mask_i, as_tuple=False).flatten()
             shared_response_ids = inputs["response_ids"][i, :response_len]
             student_response_logits = student_logits[i, student_prompt_len : student_prompt_len + response_len, :]
-            student_input_text = self._decode_model_input_text(
-                inputs["student_input_ids"][i],
-                prompt_len=student_prompt_len,
-                response_len=response_len,
-            )
 
             student_top1_token_ids = torch.argmax(student_response_logits, dim=-1)
-            student_reconstructed_ids = torch.where(kd_mask_i, student_top1_token_ids, shared_response_ids)
+            topk_token_ids, topk_probs = self._masked_topk(
+                response_logits=student_response_logits,
+                masked_positions=kd_positions,
+                k=TOP1_LOGIT_DEBUG_TOPK,
+            )
             record = {
                 "global_step": current_step,
                 "epoch_index": epoch_index,
@@ -641,10 +864,6 @@ class DiffuSelfDistillTrainer(Trainer):
                 "t_value": float(inputs["effective_t_values"][i].item()),
                 "response_length": response_len,
                 "num_masked_tokens": int(kd_positions.numel()),
-                "input_text": student_input_text,
-                "student_input_text": student_input_text,
-                "target_response_text": self._decode_token_ids(shared_response_ids),
-                "student_generated_text": self._decode_token_ids(student_reconstructed_ids),
                 "masked_response_positions": kd_positions.detach().cpu().tolist(),
                 "masked_target_token_ids": shared_response_ids.index_select(0, kd_positions).detach().cpu().tolist(),
                 "student_top1_token_ids": student_top1_token_ids.index_select(0, kd_positions).detach().cpu().tolist(),
@@ -652,7 +871,29 @@ class DiffuSelfDistillTrainer(Trainer):
                     response_logits=student_response_logits,
                     masked_positions=kd_positions,
                 ),
+                "student_masked_losses": self._masked_losses(
+                    response_logits=student_response_logits,
+                    target_token_ids=shared_response_ids,
+                    masked_positions=kd_positions,
+                ),
+                "student_masked_entropy": self._masked_entropy(
+                    response_logits=student_response_logits,
+                    masked_positions=kd_positions,
+                ),
+                "student_masked_topk_token_ids": topk_token_ids,
+                "student_masked_topk_probs": topk_probs,
             }
+            if i == 0:
+                # Keep one full-text example per logged step for qualitative
+                # spot-checks, without bloating every record in the batch.
+                student_reconstructed_ids = torch.where(kd_mask_i, student_top1_token_ids, shared_response_ids)
+                record["sample_input_text"] = self._decode_model_input_text(
+                    inputs["student_input_ids"][i],
+                    prompt_len=student_prompt_len,
+                    response_len=response_len,
+                )
+                record["sample_target_response_text"] = self._decode_token_ids(shared_response_ids)
+                record["sample_student_generated_text"] = self._decode_token_ids(student_reconstructed_ids)
             records.append(record)
 
         if not records:
@@ -661,6 +902,67 @@ class DiffuSelfDistillTrainer(Trainer):
         with open(self.top1_logit_debug_path, "a", encoding="utf-8") as f:
             for record in records:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _accumulate_t_bin_diagnostics(
+        self,
+        acc: dict[str, Any],
+        student_response_logits: torch.Tensor,
+        response_target_ids: torch.Tensor,
+        kd_positions: torch.Tensor,
+        loss_sum: float,
+        token_count: int,
+    ):
+        """t-bin별 loss/accuracy/entropy/margin/gradient-direction 진단 메트릭 누적.
+
+        Gradient 방향은 별도 backward 없이 CE loss의 logits에 대한 그라디언트인
+        softmax(logits) - one_hot(target)을 마스킹 토큰에 대해 평균낸 벡터로 근사한다.
+        """
+        acc["loss_sum"] += loss_sum
+        acc["loss_count"] += token_count
+        acc["total"] += token_count
+        acc["sample_count"] += 1
+
+        grad_vec_sum = None
+        for start, end in self._iter_chunk_ranges(int(kd_positions.numel())):
+            chunk_positions = kd_positions[start:end]
+            masked_logits = student_response_logits.index_select(0, chunk_positions).detach().float()
+            targets = response_target_ids.index_select(0, chunk_positions).to(
+                device=masked_logits.device,
+                dtype=torch.long,
+            )
+
+            probs = F.softmax(masked_logits, dim=-1)
+            top1_pred = masked_logits.argmax(dim=-1)
+            acc["correct1"] += int((top1_pred == targets).sum().item())
+
+            topk = min(5, masked_logits.shape[-1])
+            top5_vals, top5_idx = masked_logits.topk(topk, dim=-1)
+            acc["correct5"] += int((top5_idx == targets.unsqueeze(-1)).any(dim=-1).sum().item())
+
+            log_probs = F.log_softmax(masked_logits, dim=-1)
+            entropy = -(probs * log_probs).sum(dim=-1)
+            acc["entropy_sum"] += float(entropy.sum().item())
+
+            top2_idx = top5_idx[:, : min(2, topk)]
+            top2_probs = probs.gather(1, top2_idx)
+            if top2_probs.shape[-1] >= 2:
+                margin = top2_probs[:, 0] - top2_probs[:, 1]
+            else:
+                margin = top2_probs[:, 0]
+            acc["margin_sum"] += float(margin.sum().item())
+
+            one_hot = torch.zeros_like(probs)
+            one_hot.scatter_(1, targets.unsqueeze(-1), 1.0)
+            chunk_grad_sum = (probs - one_hot).sum(dim=0)
+            grad_vec_sum = chunk_grad_sum if grad_vec_sum is None else grad_vec_sum + chunk_grad_sum
+
+        grad_vec = grad_vec_sum / float(kd_positions.numel())
+        if acc["grad_vec_sum"] is None:
+            acc["grad_vec_sum"] = torch.zeros_like(grad_vec)
+        acc["grad_vec_sum"] += grad_vec
+        grad_norm = float(grad_vec.norm(p=2).item())
+        acc["grad_norm_sum"] += grad_norm
+        acc["grad_sqnorm_sum"] += grad_norm**2
 
     def _compute_masked_cross_entropy_sum(
         self,
@@ -721,18 +1023,10 @@ class DiffuSelfDistillTrainer(Trainer):
         response_budget = self.data_collator.max_length - int(student_prompt_ids.numel())
         response_budget = max(response_budget, 1)
 
-        terminal_token_id = self.data_collator.response_terminal_token_id
+        if response_ids.numel() == 0:
+            response_ids = response_ids.new_tensor([self.data_collator.fallback_token_id], dtype=torch.long)
 
-        if response_ids.numel() > 0:
-            while response_ids.numel() > 0 and int(response_ids[-1].item()) == terminal_token_id:
-                response_ids = response_ids[:-1]
-
-        content_budget = max(response_budget - 1, 0)
-        response_ids = response_ids[:content_budget]
-        response_ids = torch.cat(
-            [response_ids, response_ids.new_tensor([terminal_token_id], dtype=torch.long)],
-            dim=0,
-        )
+        response_ids = response_ids[:response_budget]
         return student_prompt_ids, response_ids
 
     def _build_kd_mask(
@@ -901,6 +1195,21 @@ class DiffuSelfDistillTrainer(Trainer):
                 )
                 kd_loss_sum = kd_loss_sum + kd_chunk_sum
                 kd_token_count += kd_chunk_count
+
+                # t 구간별 심층 진단 메트릭 누적 (학습 중에만)
+                if model.training and kd_chunk_count > 0:
+                    t_val = float(inputs["t_values"][i].item())
+                    for bin_name, t_lo, t_hi in T_BIN_DEFS:
+                        if t_lo <= t_val < t_hi:
+                            self._accumulate_t_bin_diagnostics(
+                                acc=self._t_bin_accum[bin_name],
+                                student_response_logits=student_response_logits,
+                                response_target_ids=response_target_ids,
+                                kd_positions=kd_positions,
+                                loss_sum=float(kd_chunk_sum.detach().item()),
+                                token_count=kd_chunk_count,
+                            )
+                            break
 
             if float(getattr(self.args, "ce_weight", 0.0)) > 0.0:
                 ce_chunk_sum, ce_chunk_count = self._compute_full_ce_loss_sum(

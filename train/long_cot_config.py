@@ -36,6 +36,12 @@ class DiffuSelfDistillConfig(TrainingArguments):
         default="default",
         metadata={"help": "Prompt style appended to each question: default | format | answer_first."},
     )
+    answer_block: bool = field(
+        default=False,
+        metadata={
+            "help": "If True with prompt_type=answer_first, pad the <answer>...</answer> block to a fixed 32-token length before <reasoning> starts."
+        },
+    )
     max_length: int = field(
         default=4096,
         metadata={"help": "Max total length for [prompt; response]."},
@@ -84,7 +90,7 @@ class DiffuSelfDistillConfig(TrainingArguments):
     t_sampling_mode: str = field(
         default="uniform",
         metadata={
-            "help": "How to sample t values: uniform | fixed | biased_to_one | two_point | curriculum."
+            "help": "How to sample t values: uniform | fixed | biased_to_one | biased_to_zero | logit_normal | two_point | curriculum."
         },
     )
     t_fixed: float = field(
@@ -95,6 +101,24 @@ class DiffuSelfDistillConfig(TrainingArguments):
         default=2.0,
         metadata={
             "help": "Strength for t_sampling_mode=biased_to_one. > 1 biases more samples toward higher t."
+        },
+    )
+    t_biased_to_zero_strength: float = field(
+        default=2.0,
+        metadata={
+            "help": "Strength for t_sampling_mode=biased_to_zero. > 1 biases more samples toward lower t."
+        },
+    )
+    t_logit_normal_mean: float = field(
+        default=0.0,
+        metadata={
+            "help": "Mean of the normal distribution in logit space for t_sampling_mode=logit_normal. 0 centers mass at t=0.5."
+        },
+    )
+    t_logit_normal_std: float = field(
+        default=1.0,
+        metadata={
+            "help": "Std of the normal distribution in logit space for t_sampling_mode=logit_normal."
         },
     )
     t_two_point_low: float = field(

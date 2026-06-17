@@ -5,6 +5,8 @@ logs/
 datasets/
 wandb/
 eval/eval_results/
+inference/results/
+checkpoints-log/
 
 *.log
 *.local.sh
