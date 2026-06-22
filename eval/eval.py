@@ -319,11 +319,7 @@ def extract_gsm8k_answer(
     )
 
     if "\\boxed" in truncated_generation or "\\fbox" in truncated_generation:
-        boxed_string = (
-            first_boxed_only_string(truncated_generation)
-            if prompt_style == "answer_first"
-            else last_boxed_only_string(truncated_generation)
-        )
+        boxed_string = last_boxed_only_string(truncated_generation)
         boxed_content = str(remove_boxed(boxed_string or "")).strip()
         if boxed_content and boxed_content != "..." and not re.match(r"^\.+$", boxed_content):
             parsed_answer = _extract_number(boxed_content)
@@ -407,11 +403,7 @@ def extract_math_answer(
     )
     if "\\boxed" in truncated_generation or "\\fbox" in truncated_generation:
         try:
-            boxed_string = (
-                first_boxed_only_string(truncated_generation)
-                if prompt_style == "answer_first"
-                else last_boxed_only_string(truncated_generation)
-            )
+            boxed_string = last_boxed_only_string(truncated_generation)
             parsed = remove_boxed(boxed_string)
             if parsed:
                 return parsed
@@ -1097,9 +1089,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt_style",
         type=str,
-        choices=["default", "format", "answer_first"],
+        choices=["default"],
         default="default",
-        help="Prompt format used to build eval inputs.",
+        help="Retained for output metadata only; the eval prompt now always matches the train template.",
     )
     parser.add_argument(
         "--mask_id",

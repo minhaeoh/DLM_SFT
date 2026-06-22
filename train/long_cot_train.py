@@ -172,10 +172,8 @@ def main():
         train_split=args.train_split,
         eval_split=args.eval_split,
         seed=args.seed,
-        prompt_type=args.prompt_type,
         target_response_source=args.target_response_source,
         heldout_eval_ratio=args.heldout_eval_ratio,
-        answer_block=args.answer_block,
     )
 
     if args.max_train_samples is not None:
@@ -220,7 +218,7 @@ def main():
         eval_dataset=eval_dataset,
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
