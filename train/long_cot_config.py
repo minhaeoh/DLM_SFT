@@ -29,18 +29,8 @@ class DiffuSelfDistillConfig(TrainingArguments):
         metadata={"help": "Dataset path loaded via datasets.load_from_disk()."},
     )
     target_response_source: str = field(
-        default="cot",
-        metadata={"help": "Response source used as the clean training target: cot | noncot."},
-    )
-    prompt_type: str = field(
-        default="default",
-        metadata={"help": "Prompt style appended to each question: default | format | answer_first."},
-    )
-    answer_block: bool = field(
-        default=False,
-        metadata={
-            "help": "If True with prompt_type=answer_first, pad the <answer>...</answer> block to a fixed 32-token length before <reasoning> starts."
-        },
+        default="longcot",
+        metadata={"help": "Response source used as the clean training target: longcot | shortcot."},
     )
     max_length: int = field(
         default=4096,
@@ -161,11 +151,7 @@ class DiffuSelfDistillConfig(TrainingArguments):
     )
     kd_weight: float = field(
         default=1.0,
-        metadata={"help": "Weight for forward-KL distillation loss."},
-    )
-    ce_weight: float = field(
-        default=0.5,
-        metadata={"help": "Optional auxiliary CE weight. If <= 0, CE is disabled."},
+        metadata={"help": "Scaling weight applied to the (forward-KL distillation) loss."},
     )
     loss_chunk_size: int = field(
         default=128,

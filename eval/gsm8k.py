@@ -3,54 +3,10 @@ import numpy as np
 from datasets import load_dataset
 from parsers import Parser
 
-DEFAULT_PROMPT = """
-Please reason step by step, and put your final answer within \\boxed{}.
+# Must match the train-time prompt built in long_cot_data_utils._build_math_user_prompt.
+INSTRUCTION_PROMPT = """
+Please reason step by step with the final answer inside \\boxed{}.
 """
-
-FORMAT_PROMPT = """
-Please reason step by step and respond in the following format, with the final answer inside \\boxed{}:
-
-<reasoning>
-...
-</reasoning>
-<answer>
-...
-</answer>
-"""
-
-ANSWER_FIRST_PROMPT = """
-Please reason step by step, but respond with the final answer first inside \\boxed{}, followed by the reasoning:
-
-<answer>
-...
-</answer>
-<reasoning>
-...
-</reasoning>
-"""
-
-PROMPT_STYLE_TO_TEXT = {
-    "default": DEFAULT_PROMPT,
-    "format": FORMAT_PROMPT,
-    "answer_first": ANSWER_FIRST_PROMPT,
-}
-
-PROMPT_STYLE_ALIASES = {
-    "raw": "default",
-    "raw_long_cot": "default",
-    "xml": "format",
-    "answer-first": "answer_first",
-    "answerfirst": "answer_first",
-}
-
-
-def _normalize_prompt_style(prompt_style: str) -> str:
-    normalized_prompt_style = str(prompt_style or "default").strip().lower()
-    normalized_prompt_style = PROMPT_STYLE_ALIASES.get(normalized_prompt_style, normalized_prompt_style)
-    if normalized_prompt_style not in PROMPT_STYLE_TO_TEXT:
-        valid = ", ".join(sorted(PROMPT_STYLE_TO_TEXT))
-        raise ValueError(f"Unsupported prompt_style `{prompt_style}`. Expected one of: {valid}.")
-    return normalized_prompt_style
 
 
 def _render_chat_prompt(tokenizer, user_content: str) -> str:
@@ -70,7 +26,9 @@ class GSM8KDataset(torch.utils.data.Dataset):
         end_index=-1,
     ):
         self.tokenizer = tokenizer
-        self.prompt_style = _normalize_prompt_style(prompt_style)
+        # Retained for output metadata only; the prompt is now style-independent
+        # and always matches the train template.
+        self.prompt_style = str(prompt_style or "default").strip().lower()
         self.load_test_dataset()
 
         total_examples = len(self.dataset)
@@ -112,8 +70,7 @@ class GSM8KDataset(torch.utils.data.Dataset):
         self.dataset = load_dataset("gsm8k", "main", split="test")
 
     def create_prompt(self, input_text):
-        prompt_text = PROMPT_STYLE_TO_TEXT[self.prompt_style].strip()
-        user_prompt = f"Question:\n{input_text}\n\n{prompt_text}"
+        user_prompt = f"Question:\n{input_text}\n\n{INSTRUCTION_PROMPT.strip()}"
         return _render_chat_prompt(self.tokenizer, user_prompt)
 
     def __getitem__(self, idx):

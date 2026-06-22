@@ -21,7 +21,7 @@ fi
 MODEL_PATH="${MODEL_PATH:-GSAI-ML/LLaDA-8B-Base}"
 MODEL_LABEL="${MODEL_PATH##*/}"
 DATASET_LABEL="${DATASET_LABEL:-Math-NoCoT-format-4096}"
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/minhae/diffusion/DLM_SFT/checkpoints/Math-CoT-NoCoT-20k-format-4096/LLaDA-8B-Base/BS16_math_ff_4096_SFT_tgtcot_promptformat_ep8_20260511_011052/checkpoint-752}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-/workspace/DLM_SFT/checkpoints/Math-CoT-NoCoT-20k-format-4096/LLaDA-8B-Base/BS16_math_ff_4096_SFT_tgtcot_promptformat_ep8_20260511_011052/checkpoint-752}"
 TASK="${TASK:-math}"
 GEN_LENGTH="${GEN_LENGTH:-3072}"
 DIFFUSION_STEPS="${DIFFUSION_STEPS:-3072}"

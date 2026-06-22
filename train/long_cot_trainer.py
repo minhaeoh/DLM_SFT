@@ -461,8 +461,7 @@ class DiffuSelfDistillTrainer(Trainer):
     def _reset_interval_log_accumulators(self):
         self._interval_log_count = 0
         self._interval_log_sums = {
-            "kd_loss": 0.0,
-            "ce_loss": 0.0,
+            "loss": 0.0,
             "mean_t": 0.0,
             "avg_mask_ratio": 0.0,
             "avg_student_mask_ratio": 0.0,
@@ -495,13 +494,11 @@ class DiffuSelfDistillTrainer(Trainer):
     def _accumulate_interval_log_metrics(
         self,
         inputs: dict[str, torch.Tensor],
-        kd_loss: torch.Tensor,
-        ce_loss: torch.Tensor,
+        loss: torch.Tensor,
     ):
         metrics = self._collect_batch_metrics(inputs)
         self._interval_log_count += 1
-        self._interval_log_sums["kd_loss"] += float(kd_loss.detach().item())
-        self._interval_log_sums["ce_loss"] += float(ce_loss.detach().item())
+        self._interval_log_sums["loss"] += float(loss.detach().item())
         self._interval_log_sums["mean_t"] += float(metrics.mean_t)
         self._interval_log_sums["avg_mask_ratio"] += float(metrics.avg_mask_ratio)
         self._interval_log_sums["avg_student_mask_ratio"] += float(metrics.avg_student_mask_ratio)
@@ -991,28 +988,6 @@ class DiffuSelfDistillTrainer(Trainer):
 
         return loss_total * (tau**2), int(masked_positions.numel())
 
-    def _compute_full_ce_loss_sum(
-        self,
-        student_response_logits: torch.Tensor,
-        target_token_ids: torch.Tensor,
-    ):
-        response_len = int(target_token_ids.numel())
-        if response_len <= 0:
-            return student_response_logits.new_zeros((), dtype=torch.float32), 0
-
-        loss_total = student_response_logits.new_zeros((), dtype=torch.float32)
-        for start, end in self._iter_chunk_ranges(response_len):
-            loss_total = loss_total + F.cross_entropy(
-                student_response_logits[start:end],
-                target_token_ids[start:end].to(
-                    device=student_response_logits.device,
-                    dtype=torch.long,
-                ),
-                reduction="sum",
-            ).float()
-
-        return loss_total, response_len
-
     def _fit_example_to_max_length(
         self,
         student_prompt_ids: torch.Tensor,
@@ -1049,9 +1024,7 @@ class DiffuSelfDistillTrainer(Trainer):
 
         student_sequences = []
         response_ids_per_example = []
-        ce_target_ids_per_example = []
         kd_masks = []
-        ce_masks = []
         response_lengths = []
         student_prompt_lengths = []
         effective_t_values = []
@@ -1085,13 +1058,6 @@ class DiffuSelfDistillTrainer(Trainer):
             student_prompt_lengths.append(int(student_prompt_ids.numel()))
             effective_t_values.append(float(raw_t_value.item()))
 
-            if float(getattr(self.args, "ce_weight", 0.0)) > 0.0:
-                ce_target_ids_per_example.append(response_ids.clone())
-                ce_masks.append(torch.ones(response_len, dtype=torch.bool, device=device))
-            else:
-                ce_target_ids_per_example.append(torch.full((response_len,), -100, dtype=torch.long, device=device))
-                ce_masks.append(torch.zeros(response_len, dtype=torch.bool, device=device))
-
         student_max_len = max(seq.numel() for seq in student_sequences)
         response_max_len = max(resp.numel() for resp in response_ids_per_example)
 
@@ -1103,28 +1069,22 @@ class DiffuSelfDistillTrainer(Trainer):
         )
         student_attention_mask = torch.zeros((batch_size, student_max_len), dtype=torch.long, device=device)
         response_ids = torch.full((batch_size, response_max_len), -100, dtype=torch.long, device=device)
-        ce_target_ids = torch.full((batch_size, response_max_len), -100, dtype=torch.long, device=device)
         kd_mask = torch.zeros((batch_size, response_max_len), dtype=torch.bool, device=device)
-        ce_mask = torch.zeros((batch_size, response_max_len), dtype=torch.bool, device=device)
         response_mask = torch.zeros((batch_size, response_max_len), dtype=torch.bool, device=device)
 
         for i in range(batch_size):
             student_input_ids[i, : student_sequences[i].numel()] = student_sequences[i]
             student_attention_mask[i, : student_sequences[i].numel()] = 1
             response_ids[i, : response_ids_per_example[i].numel()] = response_ids_per_example[i]
-            ce_target_ids[i, : ce_target_ids_per_example[i].numel()] = ce_target_ids_per_example[i]
             kd_mask[i, : kd_masks[i].numel()] = kd_masks[i]
-            ce_mask[i, : ce_masks[i].numel()] = ce_masks[i]
             response_mask[i, : response_ids_per_example[i].numel()] = True
 
         return {
             "student_input_ids": student_input_ids,
             "student_attention_mask": student_attention_mask,
             "response_ids": response_ids,
-            "ce_target_ids": ce_target_ids,
             "response_mask": response_mask,
             "kd_mask": kd_mask,
-            "ce_mask": ce_mask,
             "student_prompt_lengths": torch.tensor(student_prompt_lengths, dtype=torch.long, device=device),
             "response_lengths": torch.tensor(response_lengths, dtype=torch.long, device=device),
             "selected_methods": [self.method] * batch_size,
@@ -1167,13 +1127,10 @@ class DiffuSelfDistillTrainer(Trainer):
                 student_logits=student_logits,
             )
 
-        kd_loss_sum = student_logits.new_zeros((), dtype=torch.float32)
-        kd_token_count = 0
-        ce_loss_sum = student_logits.new_zeros((), dtype=torch.float32)
-        ce_token_count = 0
+        loss_sum = student_logits.new_zeros((), dtype=torch.float32)
+        token_count = 0
 
         batch_size = inputs["student_input_ids"].shape[0]
-        ce_target_ids = inputs["ce_target_ids"]
         kd_mask = inputs["kd_mask"]
         for i in range(batch_size):
             response_len = int(inputs["response_lengths"][i].item())
@@ -1187,17 +1144,17 @@ class DiffuSelfDistillTrainer(Trainer):
 
             if kd_mask_i.any():
                 kd_positions = torch.nonzero(kd_mask_i, as_tuple=False).flatten()
-                kd_chunk_sum, kd_chunk_count = self._compute_masked_cross_entropy_sum(
+                chunk_sum, chunk_count = self._compute_masked_cross_entropy_sum(
                     student_response_logits=student_response_logits,
                     target_token_ids=response_target_ids,
                     masked_positions=kd_positions,
                     temperature=float(getattr(self.args, "distill_temperature", 1.0)),
                 )
-                kd_loss_sum = kd_loss_sum + kd_chunk_sum
-                kd_token_count += kd_chunk_count
+                loss_sum = loss_sum + chunk_sum
+                token_count += chunk_count
 
                 # t 구간별 심층 진단 메트릭 누적 (학습 중에만)
-                if model.training and kd_chunk_count > 0:
+                if model.training and chunk_count > 0:
                     t_val = float(inputs["t_values"][i].item())
                     for bin_name, t_lo, t_hi in T_BIN_DEFS:
                         if t_lo <= t_val < t_hi:
@@ -1206,36 +1163,22 @@ class DiffuSelfDistillTrainer(Trainer):
                                 student_response_logits=student_response_logits,
                                 response_target_ids=response_target_ids,
                                 kd_positions=kd_positions,
-                                loss_sum=float(kd_chunk_sum.detach().item()),
-                                token_count=kd_chunk_count,
+                                loss_sum=float(chunk_sum.detach().item()),
+                                token_count=chunk_count,
                             )
                             break
 
-            if float(getattr(self.args, "ce_weight", 0.0)) > 0.0:
-                ce_chunk_sum, ce_chunk_count = self._compute_full_ce_loss_sum(
-                    student_response_logits=student_response_logits,
-                    target_token_ids=ce_target_ids[i, :response_len],
-                )
-                ce_loss_sum = ce_loss_sum + ce_chunk_sum
-                ce_token_count += ce_chunk_count
-
-        if kd_token_count > 0:
-            kd_loss = kd_loss_sum / kd_token_count
+        if token_count > 0:
+            loss = loss_sum / token_count
         else:
-            kd_loss = student_logits.sum() * 0.0
+            loss = student_logits.sum() * 0.0
 
-        if float(getattr(self.args, "ce_weight", 0.0)) > 0.0 and ce_token_count > 0:
-            ce_loss = ce_loss_sum / ce_token_count
-        else:
-            ce_loss = student_logits.sum() * 0.0
-
-        loss = float(getattr(self.args, "kd_weight", 1.0)) * kd_loss + float(getattr(self.args, "ce_weight", 0.0)) * ce_loss
+        loss = float(getattr(self.args, "kd_weight", 1.0)) * loss
 
         if model.training:
             self._accumulate_interval_log_metrics(
                 inputs=inputs,
-                kd_loss=kd_loss,
-                ce_loss=ce_loss,
+                loss=loss,
             )
 
         if return_outputs:
