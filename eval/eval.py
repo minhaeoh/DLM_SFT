@@ -292,6 +292,8 @@ def _preprocess_math_answer(s: str | None) -> str | None:
     s = s.translate(_UNICODE_MATH_MAP)
     s = re.sub(r"\\math[a-z]+\s*", "", s)
     s = re.sub(r"\\boldsymbol\s*", "", s)
+    # Drop purely cosmetic math-style directives (no semantic meaning).
+    s = re.sub(r"\\(?:displaystyle|textstyle|scriptstyle|scriptscriptstyle)\s*", "", s)
     return s
 
 

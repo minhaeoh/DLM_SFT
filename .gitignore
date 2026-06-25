@@ -8,7 +8,11 @@ wandb/
 eval/eval_results/
 inference/results/
 checkpoints-log/
+prove/scripts
 
 *.log
-*.local.sh
+# *.local.sh
 *.local.bash
+.env
+*.json
+*.out

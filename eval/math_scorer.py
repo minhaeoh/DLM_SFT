@@ -24,6 +24,8 @@ class MathScorer:
         (re.compile(r"\\mathrm\{([^}]*)\}"), r"\1"),
         (re.compile(r"\\operatorname\{([^}]*)\}"), r"\1"),
         (re.compile(r"\\text\{([^}]*)\}"), r"\1"),
+        # Cosmetic math-style directives carry no value; drop them.
+        (re.compile(r"\\(?:displaystyle|textstyle|scriptstyle|scriptscriptstyle)\s*"), ""),
     ]
 
     ANS_LINE = re.compile(r"^\s*answer\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
